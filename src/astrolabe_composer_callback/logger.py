@@ -119,13 +119,19 @@ class AstrolabeLogger(Callback):
         tags: dict[str, str] | None = None,
     ):
         self._repo = repo
-        self._experiment_name = experiment_name or os.environ.get(
-            "ASTROLABE_EXPERIMENT_NAME", ""
-        )
+        # Precedence: astrolabe env vars win when set. Astrolabe is the
+        # orchestrator; its experiment name and tags are authoritative
+        # over anything baked into a Composer training YAML. Researchers
+        # hardcoding experiment_name in their training config get that
+        # value when running standalone, but astrolabe overrides when
+        # it's the one driving the run. Without this, hardcoded YAMLs
+        # silently produce runs under the wrong Aim experiment and the
+        # dashboard can't find them.
+        env_exp = os.environ.get("ASTROLABE_EXPERIMENT_NAME", "")
+        self._experiment_name = env_exp or experiment_name
         self._log_interval = log_interval
-        self._tags: dict[str, str] = (
-            dict(tags) if tags is not None else parse_aim_run_tags(os.environ.get("AIM_RUN_TAGS"))
-        )
+        env_tags = parse_aim_run_tags(os.environ.get("AIM_RUN_TAGS"))
+        self._tags: dict[str, str] = env_tags if env_tags else (dict(tags) if tags is not None else {})
         self._run = None
         self._step = 0
         self._start_time: float = 0.0

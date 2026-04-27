@@ -61,34 +61,44 @@ class TestParseAimRunTags:
 
 
 class TestAstrolabeLoggerConstructor:
-    """Constructor wiring — the parts that don't need a live Aim server."""
+    """Constructor wiring — the parts that don't need a live Aim server.
 
-    def test_explicit_tags_used(self):
+    Precedence: astrolabe env vars (ASTROLABE_EXPERIMENT_NAME,
+    AIM_RUN_TAGS) win over constructor args. Astrolabe is the
+    orchestrator; its identity is authoritative. Constructor args are
+    the standalone fallback.
+    """
+
+    def test_explicit_tags_used_when_no_env(self, monkeypatch):
+        monkeypatch.delenv("AIM_RUN_TAGS", raising=False)
         log = AstrolabeLogger(tags={"k": "v"})
         assert log._tags == {"k": "v"}
 
-    def test_env_fallback_when_tags_none(self, monkeypatch):
+    def test_env_tags_win_over_constructor(self, monkeypatch):
+        # Astrolabe sets AIM_RUN_TAGS at engine setup. Whatever a
+        # standalone user passes via constructor is overridden — the
+        # orchestrator's tagging is authoritative.
         monkeypatch.setenv("AIM_RUN_TAGS", "astrolabe.version=v5")
-        log = AstrolabeLogger()
+        log = AstrolabeLogger(tags={"k": "v"})
         assert log._tags == {"astrolabe.version": "v5"}
 
-    def test_explicit_empty_tags_disables_env_fallback(self, monkeypatch):
-        # If a researcher passes tags={}, they're saying "no tags" — don't
-        # quietly substitute the env var. This matters when the env var is
-        # set globally (e.g. in a shell rc) and a specific run wants none.
-        monkeypatch.setenv("AIM_RUN_TAGS", "leak=true")
-        log = AstrolabeLogger(tags={})
+    def test_no_env_no_arg_yields_empty(self, monkeypatch):
+        monkeypatch.delenv("AIM_RUN_TAGS", raising=False)
+        log = AstrolabeLogger()
         assert log._tags == {}
 
-    def test_experiment_name_from_env(self, monkeypatch):
+    def test_experiment_name_from_env_wins(self, monkeypatch):
+        # Same precedence — env wins. This is the case that broke
+        # ProjectOrion: training YAMLs hardcode experiment_name and
+        # used to override astrolabe.
         monkeypatch.setenv("ASTROLABE_EXPERIMENT_NAME", "from-env")
-        log = AstrolabeLogger()
+        log = AstrolabeLogger(experiment_name="hardcoded-in-yaml")
         assert log._experiment_name == "from-env"
 
-    def test_explicit_experiment_name_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("ASTROLABE_EXPERIMENT_NAME", "from-env")
-        log = AstrolabeLogger(experiment_name="explicit")
-        assert log._experiment_name == "explicit"
+    def test_explicit_experiment_name_used_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("ASTROLABE_EXPERIMENT_NAME", raising=False)
+        log = AstrolabeLogger(experiment_name="standalone-name")
+        assert log._experiment_name == "standalone-name"
 
 
 class TestInitWithMockedAim:
