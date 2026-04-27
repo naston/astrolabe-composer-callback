@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astrolabe-composer-callback"
-version = "0.1.2"
+version = "0.1.3"
 description = "MosaicML Composer callback that logs to Aim with astrolabe's run-tagging conventions"
 requires-python = ">=3.10"
 authors = [{ name = "Nathan Paull" }]

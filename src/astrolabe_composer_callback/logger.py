@@ -144,6 +144,17 @@ class AstrolabeLogger(Callback):
                 repo=self._repo,
                 experiment=self._experiment_name or None,
             )
+            # Carry Composer's run_name through to Aim so the dashboard
+            # shows the meaningful name (e.g. "bert-tiny", "bert-2layer")
+            # set in the training YAML, not the auto-generated
+            # "Run: <hash>" placeholder. Aim's Run object exposes
+            # `name` as a writable property.
+            composer_run_name = getattr(state, "run_name", None)
+            if composer_run_name:
+                try:
+                    self._run.name = composer_run_name
+                except Exception as e:
+                    logger.debug("Failed to set Aim run name {}: {}", composer_run_name, e)
             for key, value in self._tags.items():
                 # Aim's Run is a dict-like; assignment writes a tag/param
                 # readable from the dashboard later. Tags written here
