@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astrolabe-composer-callback"
+version = "0.1.0"
+description = "MosaicML Composer callback that logs to Aim with astrolabe's run-tagging conventions"
+requires-python = ">=3.10"
+authors = [{ name = "Nathan Paull" }]
+readme = "README.md"
+license = { text = "MIT" }
+keywords = ["composer", "mosaicml", "aim", "ml-tracking", "astrolabe"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Composer + Aim are runtime requirements but we deliberately do NOT pin
+# them — the callback should work across reasonably recent versions of
+# both. Researchers' training repos already pin these to versions that
+# fit their setup.
+dependencies = [
+    "aim>=3.18",
+    "mosaicml>=0.20",
+    "loguru>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/naston/astrolabe-composer-callback"
+Issues = "https://github.com/naston/astrolabe-composer-callback/issues"
+"Astrolabe" = "https://github.com/naston/astrolabe"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
