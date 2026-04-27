@@ -134,7 +134,19 @@ class AstrolabeLogger(Callback):
         self._tags: dict[str, str] = env_tags if env_tags else (dict(tags) if tags is not None else {})
         self._run = None
         self._step = 0
+        # `_start_time` is anchored to the FIRST training batch (not init),
+        # so wall_time excludes setup: model loading, dataloader build,
+        # tokenizer warmup, etc. A run that takes 30s to set up and 60s
+        # to actually train should report wall_time = 60s, not 90s, so
+        # researchers comparing two runs aren't seeing setup-cost differences.
         self._start_time: float = 0.0
+        # `_total_eval_time` accumulates seconds spent inside eval; we
+        # subtract it from wall_time on each batch_end so wall_time is
+        # *training-only* elapsed time. Two runs with the same training
+        # cost but different eval cadence/duration land on the same
+        # wall_time for the same step — comparison stays apples-to-apples.
+        self._eval_start: float = 0.0
+        self._total_eval_time: float = 0.0
 
     def init(self, state: Any, logger_obj: Any) -> None:
         """Initialize the Aim run when training starts."""
@@ -169,7 +181,9 @@ class AstrolabeLogger(Callback):
                     self._run["hparams"] = state.model.config
                 except Exception:
                     pass
-            self._start_time = time.monotonic()
+            # Don't set _start_time here — anchor it to the first batch_end
+            # in batch_end() so setup time (model load, dataloader build,
+            # tokenizer warmup, weight init) is excluded from wall_time.
             tag_summary = (
                 f" (tags: {', '.join(f'{k}={v}' for k, v in self._tags.items())})"
                 if self._tags
@@ -182,16 +196,29 @@ class AstrolabeLogger(Callback):
             logger.warning("Aim connection failed (non-fatal): {}", e)
             self._run = None
 
+    def eval_start(self, state: Any, logger_obj: Any) -> None:
+        """Mark eval start so we can subtract eval duration from wall_time."""
+        self._eval_start = time.monotonic()
+
     def batch_end(self, state: Any, logger_obj: Any) -> None:
         """Log batch-level metrics + wall time."""
         if not self._run:
             return
 
+        # Anchor wall_time to the first training batch so setup time is
+        # excluded. _start_time stays 0 until we get here.
+        if self._start_time == 0.0:
+            self._start_time = time.monotonic()
+
         self._step += 1
         if self._step % self._log_interval != 0:
             return
 
-        elapsed = time.monotonic() - self._start_time
+        # Training-only elapsed: total time since first batch, minus
+        # accumulated eval time. Excludes setup AND eval pauses, so the
+        # wall_time x-axis reflects pure training compute. Two runs with
+        # the same training cost but different eval cadence stay aligned.
+        elapsed = (time.monotonic() - self._start_time) - self._total_eval_time
 
         # Track the canonical training loss when Composer exposes it. This
         # is the simplest path that works across model types — anything
@@ -204,12 +231,6 @@ class AstrolabeLogger(Callback):
                     else float(state.loss)
                 )
                 self._run.track(loss_val, name="train/loss", step=self._step)
-                self._run.track(
-                    loss_val,
-                    name="train/loss",
-                    step=self._step,
-                    context={"x_axis": "wall_time"},
-                )
         except Exception:
             pass
 
@@ -221,12 +242,21 @@ class AstrolabeLogger(Callback):
             pass
 
     def eval_end(self, state: Any, logger_obj: Any) -> None:
-        """Log eval metrics with cleaned-up names.
+        """Log eval metrics with cleaned-up names + bank the eval duration.
 
         Composer namespaces eval metrics by the eval-suite name (e.g.
         ``glue_mnli/accuracy``); when the suite is just called "eval" we
         flatten it to ``eval/accuracy`` for cleaner display.
+
+        Accumulates the eval duration into ``_total_eval_time`` so the
+        next batch_end's wall_time excludes it.
         """
+        # Accumulate eval duration first — even if logging fails, the
+        # wall-time accounting needs to be right.
+        if self._eval_start > 0:
+            self._total_eval_time += time.monotonic() - self._eval_start
+            self._eval_start = 0.0
+
         if not self._run:
             return
         try:
