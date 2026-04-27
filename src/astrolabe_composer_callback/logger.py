@@ -40,7 +40,15 @@ from typing import Any
 from loguru import logger
 
 try:
-    from composer.core import Callback, Logger, State
+    # Only the base Callback class needs to be a real type at runtime —
+    # it provides `run_event`, which Composer's engine calls for every
+    # lifecycle event. Logger / State are only used as type hints, so we
+    # import them as `Any` and don't depend on their import paths
+    # (which have shifted across Composer versions: Logger moved from
+    # composer.core to composer.loggers around 0.21, and importing the
+    # old path raises ImportError, which would silently drop us back
+    # to inheriting from `object` and break run_event dispatch).
+    from composer.core import Callback
 except ImportError:  # pragma: no cover — Composer is a runtime dep
     Callback = object  # type: ignore[misc,assignment]
 
