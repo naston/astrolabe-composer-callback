@@ -1,0 +1,186 @@
+name: Dep Watch
+
+# Daily Aim check, weekly framework checks. When a newer version
+# of a tracked dependency lands on PyPI, install it, re-run the
+# matching integration tests, and either commit the updated
+# tested-versions.json (on pass) or open a `dep-drift` issue (on
+# fail). See plans/tier-1.md for the discipline rules around this
+# workflow — flaky tests turn it into noise we'll ignore.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'    # daily 06:00 UTC — Aim
+    - cron: '0 6 * * 1'    # Mondays 06:00 UTC — frameworks
+  workflow_dispatch:        # manual trigger from the Actions tab
+    inputs:
+      package:
+        description: 'Single package to check (aim, mosaicml, lightning, transformers, torch). Empty = all.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # bot commits to tested-versions.json
+  issues: write     # bot opens dep-drift issues on test failure
+
+jobs:
+  # --------------------------------------------------------------------
+  # Aim — load-bearing for every callback, daily check
+  # --------------------------------------------------------------------
+  aim:
+    if: github.event.schedule == '0 6 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check for new aim version
+        id: check
+        run: python scripts/check_dep_drift.py aim
+
+      - name: Install package + new aim
+        if: steps.check.outputs.has_new_version == 'true'
+        run: |
+          pip install -e .[all]
+          pip install --upgrade aim==${{ steps.check.outputs.latest }}
+
+      - name: Run all integration tests
+        if: steps.check.outputs.has_new_version == 'true'
+        id: test
+        run: pytest tests/ -q
+
+      - name: Update tested-versions.json (on pass)
+        if: steps.check.outputs.has_new_version == 'true' && steps.test.outcome == 'success'
+        run: |
+          python scripts/update_tested_version.py aim ${{ steps.check.outputs.latest }}
+          git config user.name "astrolabe-bot"
+          git config user.email "noreply@anthropic.com"
+          git add tested-versions.json
+          git commit -m "chore(deps): aim ${{ steps.check.outputs.latest }} passed drift tests"
+          git push
+
+      - name: Open issue on test failure
+        if: steps.check.outputs.has_new_version == 'true' && steps.test.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pkg = 'aim';
+            const latest = '${{ steps.check.outputs.latest }}';
+            const lastTested = '${{ steps.check.outputs.last_tested }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `dep-drift: ${pkg} ${latest} broke integration tests`,
+              labels: ['dep-drift', `framework:${pkg}`, 'severity:critical'],
+              body: [
+                `**Framework**: ${pkg}`,
+                `**Failing version**: ${latest}`,
+                `**Last passing version**: ${lastTested}`,
+                `**Workflow run**: ${runUrl}`,
+                ``,
+                `Reproduce locally:`,
+                '```',
+                `pip install -e ".[all]"`,
+                `pip install --upgrade ${pkg}==${latest}`,
+                `pytest tests/`,
+                '```',
+                ``,
+                `If this is a real regression, add \`${latest}\` to \`_known_bad.${pkg}\` in tested-versions.json. If it's a flaky test, fix the test (do NOT add pytest-rerunfailures — see plans/tier-1.md discipline rules).`,
+              ].join('\n'),
+            });
+
+  # --------------------------------------------------------------------
+  # Frameworks — weekly check, matrix over the four supported
+  # --------------------------------------------------------------------
+  frameworks:
+    if: github.event.schedule == '0 6 * * 1' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one failing framework shouldn't skip the others
+      matrix:
+        include:
+          - package: mosaicml
+            extra: composer
+            test_file: tests/test_composer.py
+          - package: lightning
+            extra: lightning
+            test_file: tests/test_lightning.py
+          - package: transformers
+            extra: hf
+            test_file: tests/test_huggingface.py
+          - package: torch
+            extra: ''   # torch is core; no extra
+            test_file: tests/test_pytorch.py
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check for new ${{ matrix.package }} version
+        id: check
+        run: python scripts/check_dep_drift.py ${{ matrix.package }}
+
+      - name: Install package + new ${{ matrix.package }}
+        if: steps.check.outputs.has_new_version == 'true'
+        run: |
+          if [ -n "${{ matrix.extra }}" ]; then
+            pip install -e ".[${{ matrix.extra }}]"
+          else
+            pip install -e ".[all]"
+          fi
+          pip install --upgrade ${{ matrix.package }}==${{ steps.check.outputs.latest }}
+
+      - name: Run ${{ matrix.package }} integration tests
+        if: steps.check.outputs.has_new_version == 'true'
+        id: test
+        run: pytest ${{ matrix.test_file }} tests/test_core.py tests/test_distributed.py -q
+
+      - name: Update tested-versions.json (on pass)
+        if: steps.check.outputs.has_new_version == 'true' && steps.test.outcome == 'success'
+        run: |
+          python scripts/update_tested_version.py ${{ matrix.package }} ${{ steps.check.outputs.latest }}
+          git config user.name "astrolabe-bot"
+          git config user.email "noreply@anthropic.com"
+          # Pull first to avoid conflicts when matrix jobs commit in parallel
+          # (each updates a different field but on the same file).
+          git pull --rebase origin main
+          git add tested-versions.json
+          git commit -m "chore(deps): ${{ matrix.package }} ${{ steps.check.outputs.latest }} passed drift tests"
+          git push
+
+      - name: Open issue on test failure
+        if: steps.check.outputs.has_new_version == 'true' && steps.test.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pkg = '${{ matrix.package }}';
+            const latest = '${{ steps.check.outputs.latest }}';
+            const lastTested = '${{ steps.check.outputs.last_tested }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const extra = '${{ matrix.extra }}';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `dep-drift: ${pkg} ${latest} broke integration tests`,
+              labels: ['dep-drift', `framework:${pkg}`, 'severity:framework'],
+              body: [
+                `**Framework**: ${pkg}`,
+                `**Failing version**: ${latest}`,
+                `**Last passing version**: ${lastTested}`,
+                `**Workflow run**: ${runUrl}`,
+                ``,
+                `Reproduce locally:`,
+                '```',
+                extra ? `pip install -e ".[${extra}]"` : `pip install -e ".[all]"`,
+                `pip install --upgrade ${pkg}==${latest}`,
+                `pytest ${{ matrix.test_file }}`,
+                '```',
+                ``,
+                `If this is a real regression, add \`${latest}\` to \`_known_bad.${pkg}\` in tested-versions.json. If it's a flaky test, fix the test (do NOT add pytest-rerunfailures — see plans/tier-1.md discipline rules).`,
+              ].join('\n'),
+            });

@@ -1,0 +1,12 @@
+{
+  "_comment": "Highest dependency versions our integration tests have passed against. Updated automatically by .github/workflows/dep-watch.yml when a newer version is released and the drift tests still pass. _known_bad lists versions to exclude even if they're newer than _last_tested — e.g. for upstream regressions.",
+  "_last_updated": "2026-05-04",
+  "aim": "3.29.1",
+  "mosaicml": "0.32.1",
+  "lightning": "2.6.1",
+  "transformers": "4.54.0",
+  "torch": "2.7.0",
+  "_known_bad": {
+    "_comment": "Versions to exclude from acceptable ranges. Add an entry when a regression is found; remove when upstream fixes."
+  }
+}
