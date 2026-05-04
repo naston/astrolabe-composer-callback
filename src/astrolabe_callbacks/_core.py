@@ -320,9 +320,10 @@ def track_safely(
 ) -> None:
     """Call ``run.track`` with graceful degradation on failure.
 
-    Logs at ``DEBUG`` once per metric name on first failure (rate-limit
-    via the per-name set on the run object). In strict mode, re-raises
-    whatever Aim raised.
+    Logs at ``WARNING`` once per metric name on first failure (rate-limit
+    via the per-name set on the run object). Subsequent failures for the
+    same metric are silenced so we don't flood with one warning per
+    batch. In strict mode, re-raises whatever Aim raised.
 
     Parameters
     ----------
@@ -356,11 +357,14 @@ def track_safely(
                 # Some Aim versions disallow attribute writes on Run.
                 # Fall back to per-call DEBUG (noisier but still capped
                 # by user's log level filter).
-                logger.debug("Aim track failed for {}: {}", name, exc)
+                logger.warning("Aim track failed for {}: {!r}", name, exc)
                 return
         if name not in seen:
             seen.add(name)
-            logger.debug("Aim track failed for {} (suppressing further): {}", name, exc)
+            logger.warning(
+                "Aim track failed for {} (suppressing further for this metric): {!r}",
+                name, exc,
+            )
 
 
 class WallTimeTracker:

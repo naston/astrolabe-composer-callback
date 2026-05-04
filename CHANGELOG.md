@@ -16,6 +16,7 @@
 - **Strict mode**: `ASTROLABE_CALLBACK_STRICT=1` flips graceful-degrade warnings into raised exceptions for fail-fast CI behavior.
 - **Centralized eval namespace**: `_core.EVAL_METRIC_PREFIX` is the single point of truth — flips from `eval/` to `val/` in v1.0.0 alongside astrolabe v1.7's eval-runs schema. One-line change cascades to every framework.
 - **Rank-zero gating** built into every callback. N-process distributed runs produce one Aim run, not N.
+- **`track_safely` failures now log at `WARNING`** (rate-limited to once per metric name) instead of `DEBUG`. The previous default level meant `track()` failures were invisible under loguru's stock `INFO` filter — exactly the diagnostic gap that hid the multi-rank issue we hit in ProjectOrion's muon experiment. Strict mode still re-raises.
 - **Dependency drift monitoring** via scheduled GitHub Actions workflow (`dep-watch.yml`). Aim daily, frameworks weekly. New version → auto-test → commit on pass / open `dep-drift` issue on fail.
 
 ### Breaking changes (migration)
