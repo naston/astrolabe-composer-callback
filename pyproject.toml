@@ -3,14 +3,25 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "astrolabe-composer-callback"
-version = "0.1.4"
-description = "MosaicML Composer callback that logs to Aim with astrolabe's run-tagging conventions"
+name = "astrolabe-callbacks"
+version = "0.2.0"
+description = "Framework-agnostic Aim callbacks for ML training (Composer, Lightning, HuggingFace Trainer, raw PyTorch)"
 requires-python = ">=3.10"
 authors = [{ name = "Nathan Paull" }]
 readme = "README.md"
 license = { text = "MIT" }
-keywords = ["composer", "mosaicml", "aim", "ml-tracking", "astrolabe"]
+keywords = [
+    "aim",
+    "ml-tracking",
+    "astrolabe",
+    "composer",
+    "mosaicml",
+    "pytorch-lightning",
+    "lightning",
+    "huggingface",
+    "transformers",
+    "pytorch",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -21,25 +32,36 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Composer + Aim are runtime requirements but we deliberately do NOT pin
-# them — the callback should work across reasonably recent versions of
-# both. Researchers' training repos already pin these to versions that
-# fit their setup.
+
+# Base install pulls only Aim + loguru. Framework-specific callbacks
+# live behind extras so users install only what they use.
 dependencies = [
     "aim>=3.18",
-    "mosaicml>=0.20",
     "loguru>=0.7",
 ]
 
 [project.optional-dependencies]
+composer = ["mosaicml>=0.20"]
+lightning = ["lightning>=2.0"]
+hf = ["transformers>=4.30"]
+# `all` is the convenience extra for users who don't want to think
+# about which framework they need. Most users should pick a single one.
+all = [
+    "mosaicml>=0.20",
+    "lightning>=2.0",
+    "transformers>=4.30",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "mosaicml>=0.20",
+    "lightning>=2.0",
+    "transformers>=4.30",
 ]
 
 [project.urls]
-Homepage = "https://github.com/naston/astrolabe-composer-callback"
-Issues = "https://github.com/naston/astrolabe-composer-callback/issues"
+Homepage = "https://github.com/naston/astrolabe-callbacks"
+Issues = "https://github.com/naston/astrolabe-callbacks/issues"
 "Astrolabe" = "https://github.com/naston/astrolabe"
 
 [tool.setuptools.packages.find]
