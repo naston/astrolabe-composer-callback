@@ -385,7 +385,13 @@ class TestTrackSafelyFailureModes:
             track_safely(run, name="train/loss", value=0.5, step=1)
 
     def test_failures_rate_limited_per_metric_name(self, monkeypatch, caplog):
-        """Same metric failing every batch shouldn't spam logs."""
+        """Same metric failing every batch shouldn't spam logs.
+
+        Rate-limit state moved from a flat ``run._astrolabe_track_failures``
+        attribute to ``run._astrolabe_buffer._warned`` when the buffer
+        layer landed (v0.2.x). Functionally the same — first failure
+        per metric name logs WARNING, subsequent failures silenced.
+        """
 
         class TrackAlwaysFails(FakeAimRun):
             def track(self, *a, **kw):
@@ -394,12 +400,10 @@ class TestTrackSafelyFailureModes:
         monkeypatch.setattr("aim.Run", TrackAlwaysFails)
         run = open_aim_run(make_run_config())
 
-        # Call 100 times; only the first should log (subsequent
-        # suppressed by per-name set on the run object).
         for i in range(100):
             track_safely(run, name="train/loss", value=0.5, step=i)
 
-        assert "train/loss" in run._astrolabe_track_failures
+        assert "train/loss" in run._astrolabe_buffer._warned
 
     def test_different_names_each_log_once(self, monkeypatch):
         class TrackAlwaysFails(FakeAimRun):
@@ -413,7 +417,7 @@ class TestTrackSafelyFailureModes:
         track_safely(run, name="b", value=1.0)
         track_safely(run, name="c", value=1.0)
 
-        assert run._astrolabe_track_failures == {"a", "b", "c"}
+        assert run._astrolabe_buffer._warned == {"a", "b", "c"}
 
 
 class TestTrackSafelyHappyPath:

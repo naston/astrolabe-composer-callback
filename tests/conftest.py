@@ -26,6 +26,44 @@ from astrolabe_callbacks._core import RunConfig
 
 
 @pytest.fixture(autouse=True)
+def synchronous_metric_buffer(monkeypatch):
+    """Make ``_MetricBuffer.submit`` call ``run.track`` synchronously in tests.
+
+    Production behavior: submit enqueues, a daemon thread drains and
+    retries on failure. Tests asserting on tracked values right after
+    a track call would otherwise need to call ``drain_buffer(run)``
+    in 20+ places. This autouse fixture makes the buffer transparently
+    synchronous for the default test case.
+
+    Tests that need the *real* async + retry behavior live in
+    ``test_metric_buffer.py`` and override this fixture by depending
+    on a fresh ``_MetricBuffer`` directly. The async path's contract
+    is exercised there; the rest of the suite trusts that submit
+    eventually causes a track and tests the caller-visible behavior.
+    """
+    from astrolabe_callbacks import _core
+
+    def sync_submit(self, name, value, step, context):
+        self._submitted += 1
+        try:
+            self._run.track(
+                value, name=name, step=step, context=context or {}
+            )
+            self._drained += 1
+        except Exception as exc:
+            self._retried += 1
+            if name not in self._warned:
+                self._warned.add(name)
+                from loguru import logger as _logger
+                _logger.warning(
+                    "Aim track failed for {} (suppressing further for this metric): {!r}",
+                    name, exc,
+                )
+
+    monkeypatch.setattr(_core._MetricBuffer, "submit", sync_submit)
+
+
+@pytest.fixture(autouse=True)
 def clean_astrolabe_env(monkeypatch):
     """Reset all astrolabe-related env vars before each test.
 
@@ -97,6 +135,29 @@ def fake_aim_run(monkeypatch):
 
     monkeypatch.setattr("aim.Run", _Recording)
     return instances
+
+
+def drain_buffer(run: Any, timeout_s: float = 5.0) -> None:
+    """Block until a Run's metric buffer has processed all queued items.
+
+    The buffer-and-retry layer (``_MetricBuffer``) runs on a daemon
+    thread, so a track call returns before the actual ``run.track()``
+    fires. Tests that assert on tracked values right after submitting
+    them need to wait for the drainer to catch up; production code
+    only ever calls ``close_run`` (which has its own drain) so this
+    helper is test-only.
+    """
+    buffer = getattr(run, "_astrolabe_buffer", None)
+    if buffer is None:
+        return
+    if not buffer.flush(timeout_s=timeout_s):
+        # Surface the partial-drain rather than silently letting tests
+        # assert on whatever happens to have made it through.
+        depth = buffer._queue.unfinished_tasks
+        raise AssertionError(
+            f"buffer flush did not complete within {timeout_s}s "
+            f"({depth} items still pending)"
+        )
 
 
 def make_run_config(**overrides: Any) -> RunConfig:
