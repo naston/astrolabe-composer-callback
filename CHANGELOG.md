@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.2 — unreleased
+
+- **Buffer heartbeat logging.** The write-buffer's drainer thread now emits a periodic INFO snapshot (default every 5 minutes, configurable) so operators tailing logs can see how buffer health evolves over the lifetime of a run — `Aim buffer (heartbeat): N submitted, N drained, N retried, N dropped, queue depth N`. Skipped during quiet periods (no counter changed since last heartbeat) so a healthy idle drainer doesn't clutter logs. Pure observability; no notifications, no failure-handling changes. Motivation: previously a degrading buffer was invisible until `close_run`'s post-mortem summary; now you get a timeline to correlate against network events.
+
 ## v0.2.0 — 2026-05-04
 
 **Renamed**: `astrolabe-composer-callback` → `astrolabe-callbacks`. The new package supports four ML training frameworks instead of one.
