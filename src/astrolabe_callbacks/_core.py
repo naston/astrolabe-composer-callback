@@ -67,6 +67,13 @@ _DEFAULT_BUFFER_SIZE = 100_000
 _DEFAULT_RETRY_INITIAL_S = 0.5
 _DEFAULT_RETRY_MAX_S = 30.0
 _DEFAULT_DRAIN_TIMEOUT_S = 30.0
+# How often the drainer thread emits a snapshot of buffer counters at
+# INFO level — purely observational, so an operator tailing logs can
+# see "buffer is healthy / actively retrying / accumulating drops"
+# mid-run instead of waiting until close to find out. 5 min is
+# infrequent enough to not clutter logs, frequent enough to give a
+# usable timeline post-mortem.
+_DEFAULT_HEARTBEAT_INTERVAL_S = 300.0
 
 
 # Single point of truth for the during-training validation namespace.
@@ -125,11 +132,13 @@ class _MetricBuffer:
         max_size: int = _DEFAULT_BUFFER_SIZE,
         retry_initial_backoff_s: float = _DEFAULT_RETRY_INITIAL_S,
         retry_max_backoff_s: float = _DEFAULT_RETRY_MAX_S,
+        heartbeat_interval_s: float = _DEFAULT_HEARTBEAT_INTERVAL_S,
     ) -> None:
         self._run = run
         self._max_size = max_size
         self._retry_initial = retry_initial_backoff_s
         self._retry_max = retry_max_backoff_s
+        self._heartbeat_interval_s = heartbeat_interval_s
         self._queue: queue.Queue = queue.Queue(maxsize=max_size)
         self._stop = threading.Event()
         # Counters surfaced at close time for visibility — first time
@@ -139,6 +148,15 @@ class _MetricBuffer:
         self._drained = 0
         self._retried = 0
         self._dropped_oldest = 0
+        # Heartbeat state — the drainer emits a periodic INFO snapshot
+        # so operators tailing logs can see how buffer health evolves
+        # over the lifetime of a run rather than waiting for the close
+        # summary. Skip emission when nothing has changed since the
+        # last heartbeat (otherwise a quiet run would still produce a
+        # log line every interval). Initialized so the first heartbeat
+        # can fire only after the configured interval elapses.
+        self._last_heartbeat_t = time.monotonic()
+        self._last_heartbeat_snapshot: tuple[int, int, int, int] = (0, 0, 0, 0)
         # Per-metric warning rate-limit — without this a persistent
         # failure would emit a WARNING per batch.
         self._warned: set[str] = set()
@@ -148,6 +166,37 @@ class _MetricBuffer:
             daemon=True,
         )
         self._drainer.start()
+
+    def _maybe_heartbeat(self) -> None:
+        """Emit a snapshot of counters at INFO if the interval elapsed
+        and any counter advanced since the last heartbeat.
+
+        Called from the drainer's main loop, so absence of heartbeats
+        also signals the drainer thread itself is alive (or hung — a
+        long silence with no end-of-run summary either is a tell).
+        """
+        now = time.monotonic()
+        if now - self._last_heartbeat_t < self._heartbeat_interval_s:
+            return
+        self._last_heartbeat_t = now
+        snapshot = (
+            self._submitted,
+            self._drained,
+            self._retried,
+            self._dropped_oldest,
+        )
+        if snapshot == self._last_heartbeat_snapshot:
+            # Quiet period — no submits, no drains, no failures since
+            # last check. Skip the log line; the absence of activity
+            # is signal enough.
+            return
+        self._last_heartbeat_snapshot = snapshot
+        logger.info(
+            "Aim buffer (heartbeat): {} submitted, {} drained, "
+            "{} retried, {} dropped, queue depth {}",
+            *snapshot,
+            self._queue.qsize(),
+        )
 
     def submit(
         self,
@@ -237,6 +286,10 @@ class _MetricBuffer:
     def _drain_loop(self) -> None:
         """Pop items and call run.track with retry until stop + drained."""
         while True:
+            # Heartbeat is checked once per iteration. ~10 calls/sec
+            # at the queue.get timeout cadence; the time-check is
+            # nanoseconds so the loop overhead is negligible.
+            self._maybe_heartbeat()
             try:
                 # Short timeout so the loop can notice _stop even when
                 # the queue is empty. Long enough that idle CPU is

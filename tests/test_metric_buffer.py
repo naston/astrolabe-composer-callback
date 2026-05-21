@@ -224,6 +224,92 @@ class TestStrictModeBypass:
 # ----------------------------------------------------------------------
 
 
+class TestBufferHeartbeat:
+    """Periodic INFO snapshots from the drainer thread.
+
+    Purpose is purely observational — surface buffer health
+    (retries, drops, queue depth) over the run's lifetime rather
+    than only at close. No notifications, no failure-handling
+    changes; just an extra log line.
+    """
+
+    def _capture_loguru(self):
+        """Attach a loguru sink that collects records into a list.
+
+        Loguru doesn't integrate with pytest's `caplog` (which hooks
+        stdlib logging), so we install a temporary sink and yield it.
+        """
+        from loguru import logger as loguru_logger
+
+        captured: list[str] = []
+        sink_id = loguru_logger.add(
+            lambda message: captured.append(str(message)), level="INFO"
+        )
+        return captured, sink_id
+
+    def test_heartbeat_fires_after_interval_with_activity(self, fake_aim_run):
+        from loguru import logger as loguru_logger
+
+        captured, sink_id = self._capture_loguru()
+        try:
+            # Tiny heartbeat interval so the test doesn't sleep 5 min.
+            run = open_aim_run(make_run_config())
+            run._astrolabe_buffer._heartbeat_interval_s = 0.05
+
+            track_safely(run, name="x", value=1.0, step=1)
+            track_safely(run, name="x", value=2.0, step=2)
+            # Let the drainer process + heartbeat fire.
+            time.sleep(0.2)
+
+            heartbeats = [line for line in captured if "heartbeat" in line]
+            assert len(heartbeats) >= 1, (
+                f"Expected at least one heartbeat line; captured: {captured}"
+            )
+            # Heartbeat contents reflect activity that happened.
+            assert "submitted" in heartbeats[0]
+            assert "drained" in heartbeats[0]
+        finally:
+            loguru_logger.remove(sink_id)
+
+    def test_heartbeat_silent_when_no_activity_changed(self, fake_aim_run):
+        from loguru import logger as loguru_logger
+
+        captured, sink_id = self._capture_loguru()
+        try:
+            run = open_aim_run(make_run_config())
+            run._astrolabe_buffer._heartbeat_interval_s = 0.05
+            # Drainer is alive but idle — interval elapses many times
+            # without any submit/drain/retry. Should NOT spam logs.
+            time.sleep(0.3)
+            heartbeats = [line for line in captured if "heartbeat" in line]
+            assert heartbeats == [], (
+                f"Expected zero heartbeats during idle; got: {heartbeats}"
+            )
+        finally:
+            loguru_logger.remove(sink_id)
+
+    def test_heartbeat_does_not_fire_before_interval(self, fake_aim_run):
+        from loguru import logger as loguru_logger
+
+        captured, sink_id = self._capture_loguru()
+        try:
+            run = open_aim_run(make_run_config())
+            # Generous interval so it can't fire during the test.
+            run._astrolabe_buffer._heartbeat_interval_s = 60.0
+
+            for i in range(10):
+                track_safely(run, name="x", value=float(i), step=i)
+            time.sleep(0.15)
+
+            heartbeats = [line for line in captured if "heartbeat" in line]
+            assert heartbeats == [], (
+                "Heartbeat should not fire before its interval elapses; "
+                f"captured: {captured}"
+            )
+        finally:
+            loguru_logger.remove(sink_id)
+
+
 class TestBufferHappyPath:
     def test_submit_then_flush_lands_value(self, fake_aim_run):
         run = open_aim_run(make_run_config())
