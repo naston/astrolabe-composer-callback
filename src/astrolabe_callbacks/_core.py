@@ -174,6 +174,13 @@ class _MetricBuffer:
         Called from the drainer's main loop, so absence of heartbeats
         also signals the drainer thread itself is alive (or hung — a
         long silence with no end-of-run summary either is a tell).
+
+        Also persists each snapshot to ``$ASTROLABE_CALLBACK_STATS_PATH``
+        when that env var is set. astrolabe's engine sets it on Lambda
+        so the file rsyncs back at step end and survives instance
+        termination — without that file, mid-run diagnostics are lost
+        when the VM is reaped, which is exactly the moment we'd want
+        to know whether the buffer was overflowing.
         """
         now = time.monotonic()
         if now - self._last_heartbeat_t < self._heartbeat_interval_s:
@@ -196,6 +203,14 @@ class _MetricBuffer:
             "{} retried, {} dropped, queue depth {}",
             *snapshot,
             self._queue.qsize(),
+        )
+        _append_stats_line(
+            kind="heartbeat",
+            submitted=snapshot[0],
+            drained=snapshot[1],
+            retried=snapshot[2],
+            dropped=snapshot[3],
+            queue_depth=self._queue.qsize(),
         )
 
     def submit(
@@ -334,6 +349,34 @@ class _MetricBuffer:
                     time.sleep(backoff)
                     backoff = min(backoff * 2, self._retry_max)
             self._queue.task_done()
+
+
+def _append_stats_line(**fields) -> None:
+    """Append one JSONL record to ``$ASTROLABE_CALLBACK_STATS_PATH``.
+
+    No-op when the env var is unset (the standard out-of-band-of-
+    astrolabe case). All failures are silenced — this is a
+    diagnostic side-channel; if writing it breaks, the training run
+    must NOT fail.
+
+    Each record carries a wall-clock ``ts`` (Unix seconds, float)
+    plus the caller-provided fields. JSONL means each diagnostic
+    event is a single self-contained line — easy to ``tail``, easy to
+    grep, easy to parse line-by-line without loading the whole file.
+    """
+    path = os.environ.get("ASTROLABE_CALLBACK_STATS_PATH")
+    if not path:
+        return
+    try:
+        import json
+        # ~ expansion so callers can use $HOME-relative paths without
+        # depending on whatever shell expansion their launcher does.
+        expanded = os.path.expanduser(path)
+        record = {"ts": time.time(), **fields}
+        with open(expanded, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as exc:  # noqa: BLE001 — diagnostic must not raise
+        logger.debug("Failed to append callback stats line: {}", exc)
 
 
 def is_strict() -> bool:
@@ -607,6 +650,18 @@ def close_run(run: Any, *, status: str = "completed") -> None:
                 logger.warning("{}, 0 unflushed.", summary)
             else:
                 logger.info("{}, 0 unflushed.", summary)
+            # Persist the close summary to the same stats file as the
+            # heartbeats so post-mortem diagnosis has the FINAL numbers
+            # even when the training stdout is gone with the instance.
+            _append_stats_line(
+                kind="close",
+                status=status,
+                submitted=stats["submitted"],
+                drained=stats["drained"],
+                retried=stats["retried"],
+                dropped=stats["dropped_oldest"],
+                unflushed=unflushed,
+            )
         except Exception as exc:
             logger.debug("Buffer drain failed: {}", exc)
 

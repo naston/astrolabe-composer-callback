@@ -310,6 +310,106 @@ class TestBufferHeartbeat:
             loguru_logger.remove(sink_id)
 
 
+class TestStatsToDisk:
+    """The ``ASTROLABE_CALLBACK_STATS_PATH`` env var is the
+    survivability story for buffer diagnostics. Without it,
+    heartbeats and the close summary only land in the training
+    process's stdout — which dies with the Lambda instance. Astrolabe
+    sets this env var on Lambda so the file rsyncs back at step end.
+
+    Contract:
+      - No env var set → no file write attempts (and no exceptions)
+      - Env var set → each heartbeat appends one JSONL line
+      - Env var set → close_run appends one JSONL line with kind=close
+      - Path supports ~ expansion
+      - Write failures are silent (the diagnostic side-channel must
+        not bring down the training run)"""
+
+    def test_no_env_var_means_no_file(self, fake_aim_run, monkeypatch, tmp_path):
+        monkeypatch.delenv("ASTROLABE_CALLBACK_STATS_PATH", raising=False)
+        run = open_aim_run(make_run_config())
+        run._astrolabe_buffer._heartbeat_interval_s = 0.05
+        track_safely(run, name="x", value=1.0, step=1)
+        time.sleep(0.15)
+        # No file was created (we'd see it in tmp_path if it had been).
+        assert list(tmp_path.iterdir()) == []
+
+    def test_heartbeat_writes_jsonl(self, fake_aim_run, monkeypatch, tmp_path):
+        import json
+
+        stats_file = tmp_path / "stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_file))
+
+        run = open_aim_run(make_run_config())
+        run._astrolabe_buffer._heartbeat_interval_s = 0.05
+        track_safely(run, name="x", value=1.0, step=1)
+        track_safely(run, name="x", value=2.0, step=2)
+        time.sleep(0.2)
+
+        assert stats_file.exists(), "stats file should be created on first heartbeat"
+        lines = stats_file.read_text().strip().splitlines()
+        assert len(lines) >= 1
+        record = json.loads(lines[0])
+        assert record["kind"] == "heartbeat"
+        assert "ts" in record
+        assert record["submitted"] >= 2
+        assert record["drained"] >= 0
+        assert record["retried"] == 0
+        assert record["dropped"] == 0
+
+    def test_close_writes_summary_line(self, fake_aim_run, monkeypatch, tmp_path):
+        import json
+
+        stats_file = tmp_path / "stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_file))
+
+        run = open_aim_run(make_run_config())
+        for i in range(5):
+            track_safely(run, name="x", value=float(i), step=i)
+        close_run(run, status="completed")
+
+        assert stats_file.exists()
+        lines = stats_file.read_text().strip().splitlines()
+        close_records = [json.loads(l) for l in lines if json.loads(l)["kind"] == "close"]
+        assert len(close_records) == 1, f"expected exactly one close line, got {len(close_records)}"
+        r = close_records[0]
+        assert r["status"] == "completed"
+        assert r["submitted"] == 5
+        assert r["drained"] == 5
+        assert r["unflushed"] == 0
+
+    def test_tilde_path_expands(self, fake_aim_run, monkeypatch, tmp_path):
+        # Use a literal ~ in the env var and verify expansion happens.
+        # HOME=tmp_path so ~ resolves into the test dir.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", "~/stats.jsonl")
+
+        run = open_aim_run(make_run_config())
+        run._astrolabe_buffer._heartbeat_interval_s = 0.05
+        track_safely(run, name="x", value=1.0, step=1)
+        time.sleep(0.15)
+
+        assert (tmp_path / "stats.jsonl").exists()
+
+    def test_write_failure_is_silent(self, fake_aim_run, monkeypatch, tmp_path):
+        # Point the env var at an unwritable path. The buffer must
+        # NOT raise; the training run continues regardless.
+        bad_path = tmp_path / "nope" / "deep" / "stats.jsonl"
+        # Don't pre-create the parents — open() will fail. We expect
+        # the diagnostic to swallow the exception.
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(bad_path))
+
+        run = open_aim_run(make_run_config())
+        run._astrolabe_buffer._heartbeat_interval_s = 0.05
+        # If write failure raised, this would propagate and fail the test.
+        for i in range(3):
+            track_safely(run, name="x", value=float(i), step=i)
+        time.sleep(0.15)
+        # Buffer still functioning — values landed in the run.
+        run._astrolabe_buffer.flush(timeout_s=2.0)
+        assert len(run.tracked) == 3
+
+
 class TestBufferHappyPath:
     def test_submit_then_flush_lands_value(self, fake_aim_run):
         run = open_aim_run(make_run_config())
