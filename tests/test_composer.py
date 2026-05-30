@@ -111,7 +111,7 @@ class TestNameNormalizerEdgeCases:
         # internal slashes after the prefix strip.
         assert (
             _normalize_composer_metric_name("metrics/eval/glue/mnli")
-            == "eval/glue/mnli"
+            == "val/glue/mnli"
         )
 
     def test_train_metric_with_slash_in_suffix(self):
@@ -125,9 +125,9 @@ class TestNameNormalizerEdgeCases:
 
     def test_just_prefix_no_suffix(self):
         # "metrics/eval/" with empty suffix — current behavior preserves
-        # the structure and produces "eval/" as result. Aim accepts
+        # the structure and produces "val/" as result. Aim accepts
         # this; document the actual behavior.
-        assert _normalize_composer_metric_name("metrics/eval/") == "eval/"
+        assert _normalize_composer_metric_name("metrics/eval/") == "val/"
 
 
 class TestNameNormalizerHappyPath:
@@ -138,9 +138,9 @@ class TestNameNormalizerHappyPath:
             ("metrics/train/Accuracy", "train/Accuracy"),
             (
                 "metrics/eval/MaskedLanguagePerplexity",
-                "eval/MaskedLanguagePerplexity",
+                "val/MaskedLanguagePerplexity",
             ),
-            ("metrics/eval/CrossEntropy", "eval/CrossEntropy"),
+            ("metrics/eval/CrossEntropy", "val/CrossEntropy"),
             ("lr-DecoupledAdamW", "lr-DecoupledAdamW"),
             (
                 "throughput/samples_per_sec",
@@ -311,7 +311,9 @@ class TestLogMetricsHappyPath:
         cb.init(state=None, logger_obj=None)
         cb.log_metrics({"metrics/eval/MaskedLanguagePerplexity": 4.2}, step=100)
         names = [t["name"] for t in fake_aim_run[-1].tracked]
-        assert "eval/MaskedLanguagePerplexity" in names
+        # v1.0.0: Composer's ``metrics/eval/*`` re-namespaced as ``val/*``
+        # to align with astrolabe's eval-runs schema.
+        assert "val/MaskedLanguagePerplexity" in names
 
     def test_tensors_unwrapped(self, fake_aim_run):
         import torch

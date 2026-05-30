@@ -249,8 +249,8 @@ def _normalize_log_key(key: str) -> str | None:
     - ``"loss"`` → ``"train/loss"``
     - ``"learning_rate"`` → ``"train/lr"``
     - ``"grad_norm"``, ``"epoch"`` → ``"train/<key>"``
-    - ``"eval_<name>"`` → ``"<EVAL_PREFIX>/<name>"`` (default
-      ``"eval/<name>"``; flips to ``"val/<name>"`` in v1.0.0).
+    - ``"eval_<name>"`` → ``"<EVAL_PREFIX>/<name>"``
+      (``"val/<name>"`` as of v1.0.0; pre-v1.0.0 was ``"eval/<name>"``).
     - Anything else → passes through unchanged so user-added custom
       metrics still land in the run.
     """

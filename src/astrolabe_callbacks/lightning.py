@@ -18,9 +18,9 @@ rather than per-epoch). Anything that lands in ``trainer.callback_metrics``
 flows through.
 
 Convention: keys prefixed with ``val_`` or ``val/`` are treated as
-eval-side and re-namespaced under the canonical eval prefix
-(``eval/`` in v0.2.0, ``val/`` from v1.0.0). All other keys pass
-through unchanged.
+during-training validation and re-namespaced under the canonical
+prefix (``val/`` as of v1.0.0; pre-v1.0.0 this was ``eval/``). All
+other keys pass through unchanged.
 
 Usage::
 

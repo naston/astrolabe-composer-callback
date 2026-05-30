@@ -49,7 +49,7 @@ are to Composer's automatic emissions, for cleaner display:
 - ``metrics/train/<name>`` → ``train/<name>`` (Composer's per-batch
   training metrics, e.g. accuracy)
 - ``metrics/eval/<name>`` → ``<EVAL_PREFIX>/<name>`` (Composer's eval
-  metrics; ``EVAL_PREFIX`` flips from ``eval`` to ``val`` in v1.0.0)
+  metrics; ``EVAL_PREFIX`` is ``"val"`` as of v1.0.0)
 - Anything else: pass through as-is. Custom user metrics
   (``my_thing/foo``, ``throughput``) land under their original names.
 

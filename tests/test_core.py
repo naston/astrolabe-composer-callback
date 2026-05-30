@@ -531,8 +531,11 @@ class TestWallTimeTrackerHappyPath:
 
 
 class TestEvalMetricPrefix:
-    def test_default_value_is_eval(self):
-        # v0.2.0 ships back-compat. v1.0.0 will flip to "val" alongside
-        # astrolabe v1.7's eval-runs schema. This test pins the v0.2.0
-        # value; flipping it should be intentional and break this test.
-        assert EVAL_METRIC_PREFIX == "eval"
+    def test_default_value_is_val(self):
+        # v1.0.0 flipped this from "eval" to "val" alongside astrolabe
+        # v1.7's eval-runs schema. ``val/`` is during-training
+        # validation (Training tab); ``eval/`` is the prefix astrolabe
+        # uses for post-training benchmark suites tracked on separate
+        # eval Aim runs (Eval tab). Flipping back should be intentional
+        # and break this test.
+        assert EVAL_METRIC_PREFIX == "val"
