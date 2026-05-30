@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.0 — unreleased
+
+### Breaking changes
+
+- **`EVAL_METRIC_PREFIX` flipped from `"eval"` to `"val"`.** During-training validation metrics emitted by Composer (`metrics/eval/*`), HuggingFace Trainer (`eval_*`), Lightning (`val_*` / `val/*`), and the raw-PyTorch `Run.log_eval()` helper now land in Aim as `val/<name>` instead of `eval/<name>`. The change aligns with astrolabe v1.7's eval-runs schema, which uses `eval/<task_set>/<metric>` exclusively for post-training benchmark suites tracked on separate eval Aim runs (`astrolabe.kind="eval"`). The split puts during-training validation on the dashboard's Training tab and benchmark results on the new Eval tab — sharing the `eval/` prefix made them visually indistinguishable.
+
+  **Migration**: training repos that pin this package update their pin and re-run; the new prefix lands automatically. Legacy production runs already in Aim keep their `eval/*` metric names — those metrics still chart correctly on the Training tab, they just sit under a now-deprecated prefix. No retroactive migration.
+
+  **Why a major version**: anyone reading metric names back (custom dashboards, downstream tools that parse the `eval/` prefix) breaks. Single-call-site fix (`s/eval\//val\//g` on the consumer side) but it warrants a major.
+
 ## v0.2.2 — unreleased
 
 - **Buffer heartbeat logging.** The write-buffer's drainer thread now emits a periodic INFO snapshot (default every 5 minutes, configurable) so operators tailing logs can see how buffer health evolves over the lifetime of a run — `Aim buffer (heartbeat): N submitted, N drained, N retried, N dropped, queue depth N`. Skipped during quiet periods (no counter changed since last heartbeat) so a healthy idle drainer doesn't clutter logs. Pure observability; no notifications, no failure-handling changes. Motivation: previously a degrading buffer was invisible until `close_run`'s post-mortem summary; now you get a timeline to correlate against network events.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astrolabe-callbacks"
-version = "0.3.0"
+version = "1.0.0"
 description = "Framework-agnostic Aim callbacks for ML training (Composer, Lightning, HuggingFace Trainer, raw PyTorch)"
 requires-python = ">=3.10"
 authors = [{ name = "Nathan Paull" }]

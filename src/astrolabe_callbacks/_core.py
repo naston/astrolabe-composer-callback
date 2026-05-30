@@ -77,11 +77,18 @@ _DEFAULT_HEARTBEAT_INTERVAL_S = 300.0
 
 
 # Single point of truth for the during-training validation namespace.
-# v0.2.0 ships with "eval" for back-compat with existing ProjectOrion
-# runs. v1.0.0 flips this to "val" alongside astrolabe v1.7's eval-runs
-# schema, which disambiguates `val/` (during-training metrics) from
-# `Eval` (post-training eval_results.json files). Flip = one-line change.
-EVAL_METRIC_PREFIX = "eval"
+#
+# Flipped to "val" in v1.0.0 alongside astrolabe v1.7's eval-runs schema,
+# which disambiguates ``val/`` (during-training validation metrics, on
+# the training run, on the Training tab) from ``eval/`` (post-training
+# benchmark suites, on a separate eval Aim run tagged
+# ``astrolabe.kind="eval"``, on the Eval tab).
+#
+# Before v1.0.0 this was ``"eval"`` for back-compat with ProjectOrion's
+# pre-rename runs. Legacy production runs keep their ``eval/*`` metric
+# names — one-time visual mismatch in ``--include`` comparisons across
+# the boundary; the legacy runs aren't paper-cited.
+EVAL_METRIC_PREFIX = "val"
 
 # Default Aim tracking URL. Astrolabe sets up an SSH reverse tunnel
 # from the GPU instance back to the NUC's Aim server on port 43800.

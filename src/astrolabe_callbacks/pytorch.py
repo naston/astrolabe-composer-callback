@@ -170,10 +170,11 @@ class AstrolabeRun:
         """Log eval-side metrics under the during-training eval namespace.
 
         Each kwarg becomes a metric named ``<EVAL_PREFIX>/<kwarg>``,
-        where ``EVAL_PREFIX`` is currently ``"eval"`` (flipping to
-        ``"val"`` in v1.0.0 alongside astrolabe v1.7's eval-runs
-        schema). Single point of truth — the same constant feeds every
-        framework callback so the rename happens once.
+        where ``EVAL_PREFIX`` is ``"val"`` as of v1.0.0 (aligning with
+        astrolabe v1.7's eval-runs schema — the ``eval/`` prefix is
+        reserved for post-training benchmark suites on dedicated eval
+        Aim runs). Single point of truth — the same constant feeds
+        every framework callback so the rename happens once.
 
         Parameters
         ----------
