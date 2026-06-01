@@ -45,17 +45,17 @@ This is the core contract. The callback exists to forward your metrics to Aim wi
 
 Each framework emits a few well-known metric names that users don't choose. We rename those for cleaner display:
 
-- **Composer**: `loss/train/total` → `train/loss`, `metrics/train/<x>` → `train/<x>`, `metrics/eval/<x>` → `eval/<x>`
-- **Lightning**: `val_<x>` and `val/<x>` → `eval/<x>` (keeps the eval namespace consistent with the other frameworks)
-- **HF Trainer**: `loss` → `train/loss`, `learning_rate` → `train/lr`, `grad_norm`/`epoch` → `train/<x>`, `eval_<x>` → `eval/<x>`
+- **Composer**: `loss/train/total` → `train/loss`, `metrics/train/<x>` → `train/<x>`, `metrics/eval/<x>` → `val/<x>`
+- **Lightning**: `val_<x>` and `val/<x>` → `val/<x>` (keeps the validation namespace consistent with the other frameworks)
+- **HF Trainer**: `loss` → `train/loss`, `learning_rate` → `train/lr`, `grad_norm`/`epoch` → `train/<x>`, `eval_<x>` → `val/<x>`
 
-User-chosen names are **never** rewritten. If you call `self.log("my_thing/foo", x)` in a LightningModule, it lands in Aim as `my_thing/foo`. If you log `MaskedLanguagePerplexity` in a Composer eval suite, it lands as `eval/MaskedLanguagePerplexity` (the `metrics/eval/` prefix Composer emitted is renamed; the `MaskedLanguagePerplexity` name is yours).
+User-chosen names are **never** rewritten. If you call `self.log("my_thing/foo", x)` in a LightningModule, it lands in Aim as `my_thing/foo`. If you log `MaskedLanguagePerplexity` in a Composer eval suite, it lands as `val/MaskedLanguagePerplexity` (the `metrics/eval/` prefix Composer emitted is renamed; the `MaskedLanguagePerplexity` name is yours).
 
-### Eval namespace forward-compatibility
+### Validation namespace — `val/` (v1.0.0+)
 
-In v0.2.0 the eval namespace is `eval/`. In v1.0.0 it flips to `val/` to align with astrolabe v1.7's eval-runs schema (which separates *during-training* eval — what this library writes — from *post-training* `eval_results.json` evaluation). The flip is a single-line change in `_core.EVAL_METRIC_PREFIX`; everything cascades.
+As of v1.0.0 during-training validation metrics emit under `val/<name>`. Pre-v1.0.0 they emitted under `eval/<name>`; the flip aligns with astrolabe v1.7's eval-runs schema, which reserves `eval/<task_set>/<metric>` for **post-training benchmark suites** tracked on dedicated eval Aim runs ([see astrolabe's `docs/eval.md`](https://github.com/naston/astrolabe/blob/main/docs/eval.md)). The `val/` vs `eval/` split puts during-training validation on the dashboard's Training tab and benchmark results on the Eval tab — sharing one prefix made them visually indistinguishable.
 
-If you're starting fresh today, write to the eval namespace and accept that it will be renamed in a future version. If you have existing dashboards keying on `eval/`, plan to update them around v1.0.0.
+The single source of truth is `_core.EVAL_METRIC_PREFIX`; flipping it cascades through every framework callback. Legacy production runs in Aim keep their `eval/*` metric names — those still chart correctly on the Training tab; they just sit under a deprecated prefix.
 
 ## Failure handling
 

@@ -132,10 +132,12 @@ We **only** synthesize `wall_time` (training-only elapsed time, excluding setup 
 
 | Framework | Names we rewrite | Names we pass through |
 |---|---|---|
-| Composer | `loss/train/total` → `train/loss`, `metrics/train/<x>` → `train/<x>`, `metrics/eval/<x>` → `eval/<x>` | everything else |
-| Lightning | `val_<x>` and `val/<x>` → `eval/<x>` | everything else |
-| HF Trainer | `loss` → `train/loss`, `learning_rate` → `train/lr`, `grad_norm`/`epoch` → `train/<x>`, `eval_<x>` → `eval/<x>` | everything else |
-| Raw PyTorch | `log_train(**m)` → `train/<m>`, `log_eval(**m)` → `eval/<m>`, `log(name, ...)` → `<name>` | (you control namespacing) |
+| Composer | `loss/train/total` → `train/loss`, `metrics/train/<x>` → `train/<x>`, `metrics/eval/<x>` → `val/<x>` | everything else |
+| Lightning | `val_<x>` and `val/<x>` → `val/<x>` | everything else |
+| HF Trainer | `loss` → `train/loss`, `learning_rate` → `train/lr`, `grad_norm`/`epoch` → `train/<x>`, `eval_<x>` → `val/<x>` | everything else |
+| Raw PyTorch | `log_train(**m)` → `train/<m>`, `log_eval(**m)` → `val/<m>`, `log(name, ...)` → `<name>` | (you control namespacing) |
+
+> **v1.0.0**: during-training validation metrics emit under `val/` (was `eval/` in v0.x). The `eval/` namespace is now reserved for **post-training benchmark suites** logged via `astrolabe.eval_results.log_eval_table(...)` on dedicated eval Aim runs. See [astrolabe's `docs/eval.md`](https://github.com/naston/astrolabe/blob/main/docs/eval.md) for the post-training side.
 
 Renames are cosmetic, applied to framework-emitted names you didn't choose. **User-named metrics are never rewritten.** If you log a metric called `MaskedLanguagePerplexity`, it lands in Aim as `MaskedLanguagePerplexity`, not buried under any prefix.
 
