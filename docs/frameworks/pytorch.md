@@ -74,7 +74,7 @@ with Run(
     run_name=None,            # human-readable name in dashboard
 ) as run:
     run.log_train(**metrics, step=None)        # → train/<name> for each kwarg + wall_time
-    run.log_eval(**metrics, step=None)         # → eval/<name> for each kwarg
+    run.log_eval(**metrics, step=None)         # → val/<name> for each kwarg
     run.log(name, value, step=None, context=None)  # arbitrary; no namespace
     run.set_tag(name, value)                   # late-binding tag
     run.pause_eval()                           # exclude eval from wall_time
@@ -90,8 +90,8 @@ with Run(
 | `run.log_train(loss=x)` | `train/loss` |
 | `run.log_train(my_metric=x, step=5)` | `train/my_metric @ step 5` |
 | `run.log_train(...)` | always also writes `wall_time` |
-| `run.log_eval(loss=x)` | `eval/loss` |
-| `run.log_eval(custom=x)` | `eval/custom` |
+| `run.log_eval(loss=x)` | `val/loss` |
+| `run.log_eval(custom=x)` | `val/custom` |
 | `run.log("my/raw/name", x)` | `my/raw/name` (no namespace prefix) |
 | `run.set_tag("my.tag", "value")` | tag on the run, not a time-series metric |
 

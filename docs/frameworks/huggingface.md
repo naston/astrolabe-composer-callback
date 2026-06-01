@@ -61,8 +61,8 @@ trainer.train()
 | Learning rate | `train/lr` (renamed from `learning_rate`) |
 | Gradient norm | `train/grad_norm` (renamed from `grad_norm`) |
 | Epoch counter | `train/epoch` (renamed from `epoch`) |
-| Eval loss | `eval/loss` (renamed from `eval_loss`) |
-| Other eval metrics | `eval/<x>` (renamed from `eval_<x>`) |
+| Eval loss | `val/loss` (renamed from `eval_loss`) |
+| Other eval metrics | `val/<x>` (renamed from `eval_<x>`) |
 | Custom metrics from `trainer.log({...})` or `compute_metrics` | passed through unchanged |
 | Synthesized | `wall_time` (training-only elapsed seconds) |
 
@@ -85,7 +85,7 @@ trainer = Trainer(
 )
 ```
 
-In Aim: `eval/accuracy`, `eval/f1_macro`, `eval/perplexity`. The `eval_` prefix HF wraps these in is stripped by the callback.
+In Aim: `val/accuracy`, `val/f1_macro`, `val/perplexity`. The `eval_` prefix HF wraps these in is stripped and re-namespaced under `val/` by the callback (v1.0.0+; pre-v1.0.0 used `eval/`).
 
 ## Run name resolution
 

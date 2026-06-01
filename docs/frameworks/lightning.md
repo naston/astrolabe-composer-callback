@@ -34,10 +34,10 @@ class MyModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         val_loss = self.loss_fn(self(x), y)
-        # val_<x> and val/<x> are re-namespaced under eval/ in Aim:
-        self.log("val_loss", val_loss, on_epoch=True)            # → eval/loss
-        self.log("val_accuracy", accuracy, on_epoch=True)        # → eval/accuracy
-        self.log("val/perplexity", torch.exp(val_loss), on_epoch=True)  # → eval/perplexity
+        # val_<x> and val/<x> are re-namespaced under val/ in Aim (v1.0.0+):
+        self.log("val_loss", val_loss, on_epoch=True)            # → val/loss
+        self.log("val_accuracy", accuracy, on_epoch=True)        # → val/accuracy
+        self.log("val/perplexity", torch.exp(val_loss), on_epoch=True)  # → val/perplexity
 ```
 
 ## Full example
@@ -68,7 +68,7 @@ trainer.fit(model, train_loader, val_loader)
 | Source | Aim metric name |
 |---|---|
 | `self.log("name", val)` in `training_step` | `name` (passed through unchanged) |
-| `self.log("val_<x>", val)` or `self.log("val/<x>", val)` in `validation_step` | `eval/<x>` |
+| `self.log("val_<x>", val)` or `self.log("val/<x>", val)` in `validation_step` | `val/<x>` |
 | `self.log("loss", val, on_step=True)` | `loss` (your name; not auto-renamed to `train/loss`) |
 | Synthesized | `wall_time` (training-only elapsed seconds, eval-paused) |
 
