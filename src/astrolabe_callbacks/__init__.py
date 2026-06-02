@@ -1,11 +1,19 @@
-"""astrolabe-callbacks — framework-agnostic Aim callbacks for ML training.
+"""astrolabe-callbacks — framework-agnostic Aim instrumentation for ML training.
 
-Public API (pick the one that matches your framework)::
+Public API::
 
     from astrolabe_callbacks import AstrolabeComposerLogger    # MosaicML Composer
     from astrolabe_callbacks import AstrolabeLightningLogger   # PyTorch Lightning
     from astrolabe_callbacks import AstrolabeHFTrainerCallback # HuggingFace Trainer
     from astrolabe_callbacks import Run                        # raw PyTorch / JAX / custom loops
+    from astrolabe_callbacks import log_eval_table             # post-training benchmark results
+
+The per-framework training callbacks (and the raw-loop ``Run`` context
+manager) stream ``train/`` and ``val/`` metrics as your model trains.
+``log_eval_table`` / ``start_eval_run`` log post-training benchmark
+suites (GLUE, MMLU, …) under the ``eval/<task_set>/<metric>`` namespace
+on a separate Aim run — that's what populates astrolabe's dashboard
+Eval tab.
 
 Each per-framework class is imported lazily — `import astrolabe_callbacks`
 only needs `aim` and `loguru`. Framework dependencies are pulled in on
@@ -16,11 +24,19 @@ aren't installed::
     pip install astrolabe-callbacks[lightning]
     pip install astrolabe-callbacks[hf]
     pip install astrolabe-callbacks[all]
+
+The eval helpers need only the base install (`aim`) — no framework extra.
 """
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+from astrolabe_callbacks.eval_results import (
+    EvalInputError,
+    log_eval_table,
+    start_eval_run,
+)
+
+__version__ = "1.1.0"
 
 __all__ = [
     "AstrolabeComposerLogger",
@@ -28,6 +44,9 @@ __all__ = [
     "AstrolabeHFTrainerCallback",
     "AstrolabeRun",
     "Run",
+    "log_eval_table",
+    "start_eval_run",
+    "EvalInputError",
     "__version__",
 ]
 

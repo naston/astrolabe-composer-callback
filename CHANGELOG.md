@@ -1,6 +1,18 @@
 # Changelog
 
-## v1.0.0 — unreleased
+## v1.1.0 — unreleased
+
+### Added
+
+- **`log_eval_table` / `start_eval_run` — post-training eval logging.** Moved from the main `astrolabe` package into this library so training/eval repos depend on **one** lightweight package for all Aim instrumentation instead of also pulling in the orchestration framework. The helpers log benchmark-suite results (GLUE, MMLU, …) under the `eval/<task_set>/<metric>` namespace on a dedicated Aim run tagged `astrolabe.kind="eval"`, which populates astrolabe's dashboard Eval tab. Available from the base install (`pip install astrolabe-callbacks`) — no framework extra needed. See [`docs/eval-results.md`](docs/eval-results.md).
+  - Connection follows the library's standard convention: `aim_url` argument, overridden by `ASTROLABE_AIM_URL`, defaulting to `aim://localhost:43800`. (The original `astrolabe.eval_results` took a filesystem `aim_repo` path; the parameter is renamed and now URL-first to match the framework callbacks. `aim.Run` still accepts a filesystem path if you pass one.)
+  - `EvalInputError` is exported for callers that want to catch malformed-input rejections.
+
+### Fixed
+
+- **`__version__` drift.** `astrolabe_callbacks.__version__` was stuck at `"0.2.0"` while `pyproject.toml` had moved to `1.0.0`. Both now read `1.1.0` from a single bump.
+
+## v1.0.0 — 2026-05-30
 
 ### Breaking changes
 
