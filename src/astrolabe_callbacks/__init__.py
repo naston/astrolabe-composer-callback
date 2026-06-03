@@ -36,7 +36,7 @@ from astrolabe_callbacks.eval_results import (
     start_eval_run,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 __all__ = [
     "AstrolabeComposerLogger",

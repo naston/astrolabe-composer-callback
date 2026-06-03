@@ -67,6 +67,19 @@ _DEFAULT_BUFFER_SIZE = 100_000
 _DEFAULT_RETRY_INITIAL_S = 0.5
 _DEFAULT_RETRY_MAX_S = 30.0
 _DEFAULT_DRAIN_TIMEOUT_S = 30.0
+
+# Per-item retry cap. With exponential backoff (0.5 → 1 → 2 → 4 → 8 → 16 → 30
+# → 30 → 30 → 30), 10 attempts span ~152s ≈ 2.5 minutes of trying before
+# the drainer gives up on a single item and moves on. Bounded retry is
+# the wedge protection: pre-v1.1.1 the loop was ``while True`` with no
+# exit, so a single ``run.track()`` call that consistently raised (server
+# state issue, validation reject of one value, anything that doesn't
+# resolve on its own) would pin the drainer on that item forever. Every
+# subsequent item would queue up behind it and either drop-oldest after
+# the 100k queue fills or be lost on close(). Observed signature: clean
+# cliff at step N, no recovery, hundreds-to-thousands of subsequent
+# metrics silently missing from Aim while TB has them.
+_DEFAULT_MAX_RETRIES = 10
 # How often the drainer thread emits a snapshot of buffer counters at
 # INFO level — purely observational, so an operator tailing logs can
 # see "buffer is healthy / actively retrying / accumulating drops"
@@ -139,20 +152,28 @@ class _MetricBuffer:
         max_size: int = _DEFAULT_BUFFER_SIZE,
         retry_initial_backoff_s: float = _DEFAULT_RETRY_INITIAL_S,
         retry_max_backoff_s: float = _DEFAULT_RETRY_MAX_S,
+        max_retries: int = _DEFAULT_MAX_RETRIES,
         heartbeat_interval_s: float = _DEFAULT_HEARTBEAT_INTERVAL_S,
     ) -> None:
         self._run = run
         self._max_size = max_size
         self._retry_initial = retry_initial_backoff_s
         self._retry_max = retry_max_backoff_s
+        self._max_retries = max_retries
         self._heartbeat_interval_s = heartbeat_interval_s
         self._queue: queue.Queue = queue.Queue(maxsize=max_size)
         self._stop = threading.Event()
         # Counters surfaced at close time for visibility — first time
         # you see retried > 0 you know the network had trouble even
-        # though your training didn't.
+        # though your training didn't. ``dropped_failed`` is new in
+        # v1.1.1 and is the load-bearing counter for wedge diagnosis:
+        # non-zero means individual items hit the per-item retry cap
+        # and were given up on, which usually points at a persistent
+        # server-side or value-validation issue rather than a transient
+        # network blip.
         self._submitted = 0
         self._drained = 0
+        self._dropped_failed = 0
         self._retried = 0
         self._dropped_oldest = 0
         # Heartbeat state — the drainer emits a periodic INFO snapshot
@@ -163,7 +184,7 @@ class _MetricBuffer:
         # log line every interval). Initialized so the first heartbeat
         # can fire only after the configured interval elapses.
         self._last_heartbeat_t = time.monotonic()
-        self._last_heartbeat_snapshot: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._last_heartbeat_snapshot: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0)
         # Per-metric warning rate-limit — without this a persistent
         # failure would emit a WARNING per batch.
         self._warned: set[str] = set()
@@ -198,6 +219,7 @@ class _MetricBuffer:
             self._drained,
             self._retried,
             self._dropped_oldest,
+            self._dropped_failed,
         )
         if snapshot == self._last_heartbeat_snapshot:
             # Quiet period — no submits, no drains, no failures since
@@ -207,7 +229,7 @@ class _MetricBuffer:
         self._last_heartbeat_snapshot = snapshot
         logger.info(
             "Aim buffer (heartbeat): {} submitted, {} drained, "
-            "{} retried, {} dropped, queue depth {}",
+            "{} retried, {} dropped_oldest, {} dropped_failed, queue depth {}",
             *snapshot,
             self._queue.qsize(),
         )
@@ -217,6 +239,7 @@ class _MetricBuffer:
             drained=snapshot[1],
             retried=snapshot[2],
             dropped=snapshot[3],
+            dropped_failed=snapshot[4],
             queue_depth=self._queue.qsize(),
         )
 
@@ -302,6 +325,7 @@ class _MetricBuffer:
             "drained": self._drained,
             "retried": self._retried,
             "dropped_oldest": self._dropped_oldest,
+            "dropped_failed": self._dropped_failed,
             "queue_depth": self._queue.qsize(),
         }
 
@@ -332,7 +356,9 @@ class _MetricBuffer:
 
             name, value, step, context = item
             backoff = self._retry_initial
+            attempts = 0
             while True:
+                attempts += 1
                 try:
                     self._run.track(
                         value, name=name, step=step, context=context or {}
@@ -342,16 +368,54 @@ class _MetricBuffer:
                 except Exception as exc:
                     self._retried += 1
                     if name not in self._warned:
+                        # First failure for this metric name. Loud
+                        # WARNING via stdout AND mirrored to the
+                        # disk-stats jsonl. The stdout line gets eaten
+                        # by composer's launcher when ranks SIGABRT on
+                        # exit (observed 2026-06-03), so the disk-stats
+                        # mirror is what actually survives post-mortem.
                         self._warned.add(name)
                         logger.warning(
                             "Aim track failed for {} — buffer will retry "
-                            "(suppressing further warnings for this metric): {!r}",
+                            "(suppressing further stdout warnings for this metric): {!r}",
                             name,
                             exc,
+                        )
+                        _append_stats_line(
+                            kind="track_failed_first",
+                            metric=name,
+                            step=step,
+                            attempts=attempts,
+                            exception=repr(exc)[:200],
                         )
                     if self._stop.is_set():
                         # Shutting down; give up on this item rather
                         # than blocking the drainer's exit indefinitely.
+                        break
+                    if attempts >= self._max_retries:
+                        # Bounded retry. Per-item cap reached — drop
+                        # this one, increment dropped_failed, move on.
+                        # Pre-v1.1.1 this was an unbounded ``while
+                        # True`` so a single persistently-failing item
+                        # pinned the drainer forever and every item
+                        # behind it was lost. Now: at most ~2.5min of
+                        # trying before we cut bait, drainer keeps
+                        # flowing, recovery becomes possible if the
+                        # underlying cause clears.
+                        self._dropped_failed += 1
+                        logger.warning(
+                            "Aim track gave up on {} after {} attempts (last error: {!r}); "
+                            "dropped_failed={}",
+                            name, attempts, exc, self._dropped_failed,
+                        )
+                        _append_stats_line(
+                            kind="track_dropped_failed",
+                            metric=name,
+                            step=step,
+                            attempts=attempts,
+                            exception=repr(exc)[:200],
+                            dropped_failed_total=self._dropped_failed,
+                        )
                         break
                     time.sleep(backoff)
                     backoff = min(backoff * 2, self._retry_max)
@@ -641,7 +705,13 @@ def close_run(run: Any, *, status: str = "completed") -> None:
                 f"Aim buffer: {stats['submitted']} submitted, "
                 f"{stats['drained']} drained, "
                 f"{stats['retried']} retried, "
-                f"{stats['dropped_oldest']} dropped"
+                f"{stats['dropped_oldest']} dropped_oldest, "
+                f"{stats['dropped_failed']} dropped_failed"
+            )
+            had_drops = (
+                stats["retried"] > 0
+                or stats["dropped_oldest"] > 0
+                or stats["dropped_failed"] > 0
             )
             if unflushed:
                 logger.warning(
@@ -650,10 +720,10 @@ def close_run(run: Any, *, status: str = "completed") -> None:
                     summary,
                     unflushed,
                 )
-            elif stats["retried"] > 0 or stats["dropped_oldest"] > 0:
+            elif had_drops:
                 # Non-trivial buffer activity — surface it so the
-                # operator notices network instability even though
-                # training succeeded.
+                # operator notices network instability or persistent
+                # per-item failures even though training succeeded.
                 logger.warning("{}, 0 unflushed.", summary)
             else:
                 logger.info("{}, 0 unflushed.", summary)
@@ -667,6 +737,7 @@ def close_run(run: Any, *, status: str = "completed") -> None:
                 drained=stats["drained"],
                 retried=stats["retried"],
                 dropped=stats["dropped_oldest"],
+                dropped_failed=stats["dropped_failed"],
                 unflushed=unflushed,
             )
         except Exception as exc:

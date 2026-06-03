@@ -434,3 +434,176 @@ class TestBufferHappyPath:
         assert stats["drained"] == 20
         assert stats["retried"] == 0
         assert stats["dropped_oldest"] == 0
+
+
+class TestBoundedRetry:
+    """v1.1.1 — per-item retry cap. Pre-fix the drainer's inner retry
+    loop was ``while True``: a single persistently-failing
+    ``run.track()`` call pinned the drainer forever, and every item
+    queued behind it was lost (either drop-oldest after the 100k queue
+    fills or simply lost on close()).
+
+    Observed signature 2026-06-03: 04-muon-adamw-handoff v7 captured
+    753 of 2470 train/loss steps in Aim (clean cliff at step 752),
+    while TB had the full trace from the same training process.
+    """
+
+    def test_dropped_failed_increments_after_max_retries(self, monkeypatch):
+        """A track call that ALWAYS fails should be retried up to
+        max_retries then given up on. dropped_failed reflects each
+        such giveup; the drainer keeps flowing for new items."""
+        class AlwaysFails(FakeAimRun):
+            def track(self, value, name=None, step=None, context=None):
+                raise RuntimeError("server says no")
+
+        monkeypatch.setattr("aim.Run", AlwaysFails)
+        run = open_aim_run(make_run_config())
+        buf = run._astrolabe_buffer
+        # Fast retries + tight cap so the test doesn't wait minutes.
+        buf._retry_initial = 0.001
+        buf._retry_max = 0.005
+        buf._max_retries = 3
+
+        track_safely(run, name="train/loss", value=0.5, step=1)
+        # Wait for the drainer to exhaust retries on this one item.
+        # 3 attempts × ~5ms + slack.
+        assert buf.flush(timeout_s=2.0)
+
+        stats = buf.stats()
+        assert stats["submitted"] == 1
+        assert stats["drained"] == 0
+        # 3 attempts means 3 retry-counter increments (one per failed
+        # track call). The 3rd one hits the cap and triggers the giveup.
+        assert stats["retried"] == 3
+        assert stats["dropped_failed"] == 1
+
+    def test_drainer_keeps_flowing_after_dropped_failed(self, monkeypatch):
+        """Once a poisoned item is dropped, subsequent items that DO
+        succeed should drain normally. Pre-fix this never happened —
+        the drainer never moved past the wedged item, so item #2
+        sat in the queue forever."""
+        fail_for = {"train/loss"}
+
+        class SelectiveFail(FakeAimRun):
+            def track(self, value, name=None, step=None, context=None):
+                if name in fail_for:
+                    raise RuntimeError(f"{name} rejected")
+                super().track(value, name=name, step=step, context=context)
+
+        monkeypatch.setattr("aim.Run", SelectiveFail)
+        run = open_aim_run(make_run_config())
+        buf = run._astrolabe_buffer
+        buf._retry_initial = 0.001
+        buf._retry_max = 0.005
+        buf._max_retries = 3
+
+        # The poisoned item goes first, then a healthy one.
+        track_safely(run, name="train/loss", value=0.5, step=1)
+        track_safely(run, name="train/accuracy", value=0.95, step=1)
+        assert buf.flush(timeout_s=2.0)
+
+        stats = buf.stats()
+        assert stats["dropped_failed"] == 1
+        assert stats["drained"] == 1  # the healthy item made it through
+        # And run.tracked has only the healthy one.
+        assert run.tracked == [
+            {"name": "train/accuracy", "value": 0.95, "step": 1, "context": {}}
+        ]
+
+    def test_dropped_failed_in_heartbeat(self, monkeypatch, tmp_path):
+        """Heartbeat snapshot includes dropped_failed so a long-running
+        run shows the counter rising as poisoned items accumulate —
+        without needing to wait for close(). Mirrored to the disk-stats
+        jsonl so survives composer-SIGABRT stdout loss."""
+        stats_path = tmp_path / "callback-stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_path))
+
+        class AlwaysFails(FakeAimRun):
+            def track(self, value, name=None, step=None, context=None):
+                raise RuntimeError("nope")
+
+        monkeypatch.setattr("aim.Run", AlwaysFails)
+        run = open_aim_run(make_run_config())
+        buf = run._astrolabe_buffer
+        buf._retry_initial = 0.001
+        buf._retry_max = 0.005
+        buf._max_retries = 2
+        # Force a heartbeat on every drainer iteration so we don't
+        # wait 5 minutes.
+        buf._heartbeat_interval_s = 0.0
+
+        track_safely(run, name="x", value=1.0, step=0)
+        buf.flush(timeout_s=2.0)
+        # Force one more heartbeat-cycle observation.
+        time.sleep(0.1)
+
+        import json
+        lines = [json.loads(ln) for ln in stats_path.read_text().splitlines() if ln.strip()]
+        # We expect at least one heartbeat reflecting dropped_failed=1.
+        heartbeats = [ln for ln in lines if ln.get("kind") == "heartbeat"]
+        assert any(hb.get("dropped_failed", 0) >= 1 for hb in heartbeats), (
+            f"no heartbeat carried dropped_failed>=1; lines={lines}"
+        )
+
+    def test_first_failure_mirrored_to_disk_stats(self, monkeypatch, tmp_path):
+        """The 'Aim track failed for X' WARNING goes to stdout, which
+        composer's launcher loses to SIGABRT. Mirror it as a jsonl
+        record so post-mortem diagnosis isn't blind."""
+        stats_path = tmp_path / "callback-stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_path))
+
+        class AlwaysFails(FakeAimRun):
+            def track(self, value, name=None, step=None, context=None):
+                raise RuntimeError("kaboom")
+
+        monkeypatch.setattr("aim.Run", AlwaysFails)
+        run = open_aim_run(make_run_config())
+        buf = run._astrolabe_buffer
+        buf._retry_initial = 0.001
+        buf._retry_max = 0.005
+        buf._max_retries = 2
+
+        track_safely(run, name="train/loss", value=0.5, step=42)
+        buf.flush(timeout_s=2.0)
+
+        import json
+        lines = [json.loads(ln) for ln in stats_path.read_text().splitlines() if ln.strip()]
+        first_failures = [ln for ln in lines if ln.get("kind") == "track_failed_first"]
+        assert len(first_failures) == 1
+        ff = first_failures[0]
+        assert ff["metric"] == "train/loss"
+        assert ff["step"] == 42
+        assert "kaboom" in ff["exception"]
+
+        # And the give-up record after retries exhaust.
+        givenup = [ln for ln in lines if ln.get("kind") == "track_dropped_failed"]
+        assert len(givenup) == 1
+        gu = givenup[0]
+        assert gu["metric"] == "train/loss"
+        assert gu["attempts"] == 2
+        assert gu["dropped_failed_total"] == 1
+
+    def test_close_summary_includes_dropped_failed(self, monkeypatch):
+        """The close-run summary surfaces dropped_failed so anyone
+        glancing at the post-run log can see how many items the
+        drainer gave up on."""
+        class AlwaysFails(FakeAimRun):
+            def track(self, value, name=None, step=None, context=None):
+                raise RuntimeError("permanent")
+
+        monkeypatch.setattr("aim.Run", AlwaysFails)
+        run = open_aim_run(make_run_config())
+        buf = run._astrolabe_buffer
+        buf._retry_initial = 0.001
+        buf._retry_max = 0.005
+        buf._max_retries = 2
+
+        track_safely(run, name="metric_a", value=1.0, step=0)
+        track_safely(run, name="metric_b", value=2.0, step=0)
+        buf.flush(timeout_s=2.0)
+
+        stats = buf.stats()
+        # Both items failed permanently; both dropped.
+        assert stats["dropped_failed"] == 2
+        # close_run shouldn't raise even with a buffer that gave up.
+        close_run(run, status="failed")
