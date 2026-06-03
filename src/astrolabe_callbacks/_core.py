@@ -255,6 +255,7 @@ class _MetricBuffer:
         try:
             self._queue.put_nowait(item)
             self._submitted += 1
+            self._maybe_submit_sample(name, step)
             return
         except queue.Full:
             pass
@@ -271,9 +272,30 @@ class _MetricBuffer:
         try:
             self._queue.put_nowait(item)
             self._submitted += 1
+            self._maybe_submit_sample(name, step)
         except queue.Full:
             # Concurrent drainer beat us back to full. Concede.
             self._dropped_oldest += 1
+
+    def _maybe_submit_sample(self, name: str, step: int | None) -> None:
+        """Write a ``submit_sample`` line to the disk-stats jsonl every
+        Nth submit (default N=1000) and the very first one.
+
+        Without this, the receive timeline of metrics is invisible
+        post-mortem — heartbeats only show counters at 5-minute
+        resolution, and ``wall_time`` in Aim is the metric's compute
+        time on the trainer, not when the buffer received it. This
+        gives us actual wall-clock-vs-step correlation at submit
+        granularity capped at ~100 records per run (so it doesn't
+        bloat the jsonl).
+        """
+        if self._submitted == 1 or self._submitted % 1000 == 0:
+            _append_stats_line(
+                kind="submit_sample",
+                metric=name,
+                step=step,
+                total_submits=self._submitted,
+            )
 
     def flush(self, timeout_s: float = 5.0) -> bool:
         """Block until all currently-queued items have been processed.
@@ -330,7 +352,41 @@ class _MetricBuffer:
         }
 
     def _drain_loop(self) -> None:
-        """Pop items and call run.track with retry until stop + drained."""
+        """Pop items and call run.track with retry until stop + drained.
+
+        v1.1.2: wrapped in a top-level try/except so an uncaught
+        exception inside the loop (heartbeat write, logger sink
+        failure, unexpected item shape, etc.) doesn't silently kill
+        the daemon thread. If the drainer dies, training keeps
+        submitting; counters get out of sync with what Aim sees; the
+        buffer eventually fills and drops items. Capturing the death
+        as a ``drainer_died`` line in the disk-stats jsonl makes that
+        scenario diagnosable post-mortem instead of looking exactly
+        like "Aim writes just stopped".
+        """
+        try:
+            self._drain_loop_inner()
+        except BaseException as exc:
+            # BaseException, not Exception, so we also capture
+            # KeyboardInterrupt / SystemExit / GeneratorExit — anything
+            # that can end a thread silently. For a daemon thread doing
+            # background work, "thread died" matters regardless of
+            # whether the cause is an Exception or a BaseException.
+            import traceback
+            logger.exception("Aim buffer drainer thread died: {!r}", exc)
+            _append_stats_line(
+                kind="drainer_died",
+                exception=repr(exc)[:300],
+                traceback=traceback.format_exc()[:1500],
+            )
+            # Don't re-raise — letting the exception propagate from a
+            # daemon thread spams ``sys.excepthook`` and (for some
+            # exception types) can interrupt the main thread. The
+            # disk-stats record is the diagnostic; the drainer just
+            # exits.
+            return
+
+    def _drain_loop_inner(self) -> None:
         while True:
             # Heartbeat is checked once per iteration. ~10 calls/sec
             # at the queue.get timeout cadence; the time-check is

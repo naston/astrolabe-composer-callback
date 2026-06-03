@@ -346,11 +346,15 @@ class TestStatsToDisk:
         track_safely(run, name="x", value=2.0, step=2)
         time.sleep(0.2)
 
-        assert stats_file.exists(), "stats file should be created on first heartbeat"
+        assert stats_file.exists(), "stats file should be created"
         lines = stats_file.read_text().strip().splitlines()
-        assert len(lines) >= 1
-        record = json.loads(lines[0])
-        assert record["kind"] == "heartbeat"
+        # v1.1.2 adds submit_sample lines on the 1st submit and every
+        # 1000th — so the first JSONL entry is now a submit_sample,
+        # not the heartbeat. Find the first heartbeat in the file.
+        records = [json.loads(ln) for ln in lines]
+        heartbeats = [r for r in records if r["kind"] == "heartbeat"]
+        assert len(heartbeats) >= 1, f"no heartbeat record in stats: {records}"
+        record = heartbeats[0]
         assert "ts" in record
         assert record["submitted"] >= 2
         assert record["drained"] >= 0
@@ -607,3 +611,82 @@ class TestBoundedRetry:
         assert stats["dropped_failed"] == 2
         # close_run shouldn't raise even with a buffer that gave up.
         close_run(run, status="failed")
+
+
+class TestSubmitSample:
+    """v1.1.2 — every Nth submit writes a ``submit_sample`` line to the
+    disk-stats jsonl. Receive-timeline diagnostic that gives us
+    actual wall-clock-vs-step correlation at coarse resolution. With
+    ~100k submits per run, capping at every 1000th yields ~100 lines
+    added per run — cheap."""
+
+    def test_submit_sample_first_and_every_1000th(
+        self, fake_aim_run, monkeypatch, tmp_path
+    ):
+        stats_file = tmp_path / "stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_file))
+
+        run = open_aim_run(make_run_config())
+        buf: _MetricBuffer = run._astrolabe_buffer
+
+        for i in range(2050):
+            buf.submit(name="x", value=float(i), step=i, context=None)
+        # Wait for drainer to catch up so subsequent reads see the file.
+        buf.flush(timeout_s=2.0)
+
+        import json
+        records = [
+            json.loads(ln) for ln in stats_file.read_text().splitlines() if ln.strip()
+        ]
+        samples = [r for r in records if r.get("kind") == "submit_sample"]
+        totals = [s["total_submits"] for s in samples]
+        # 1st + 1000th + 2000th expected.
+        assert totals == [1, 1000, 2000], f"got: {totals}"
+
+
+class TestDrainerDeathCapture:
+    """v1.1.2 — H4 detector. If the drainer thread dies from any
+    uncaught exception (including BaseException subclasses that
+    escape the inner ``except Exception``), capture the death as a
+    ``drainer_died`` record before the thread exits. Pre-v1.1.2 the
+    daemon thread died silently and there was no signal in any log."""
+
+    def test_drainer_death_recorded_in_disk_stats(self, monkeypatch, tmp_path):
+        import time as _time
+        import json
+
+        stats_file = tmp_path / "stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_file))
+
+        # BaseException subclass to escape the inner retry's
+        # ``except Exception``. Custom (not KeyboardInterrupt) so we
+        # don't trigger Python's special-case main-thread propagation.
+        class SyntheticDrainerPoison(BaseException):
+            pass
+
+        class Run:
+            tracked = []
+            def track(self, value, name=None, step=None, context=None):
+                raise SyntheticDrainerPoison("synthetic drainer poison")
+            def close(self):
+                pass
+
+        run = Run()
+        buf = _MetricBuffer(run)
+        buf.submit(name="x", value=1.0, step=0, context=None)
+
+        # Give the drainer thread a moment to pop the item, raise,
+        # and write the death record.
+        _time.sleep(0.5)
+
+        records = [
+            json.loads(ln)
+            for ln in stats_file.read_text().splitlines()
+            if ln.strip()
+        ]
+        deaths = [r for r in records if r.get("kind") == "drainer_died"]
+        assert len(deaths) == 1, (
+            f"expected one drainer_died record, got records: {records}"
+        )
+        assert "SyntheticDrainerPoison" in deaths[0]["exception"]
+        assert "traceback" in deaths[0]

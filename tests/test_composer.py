@@ -16,7 +16,8 @@ from astrolabe_callbacks.composer import (
     _normalize_composer_metric_name,
     _to_scalar,
 )
-from tests.conftest import FakeAimRun
+from astrolabe_callbacks._core import open_aim_run, track_safely
+from tests.conftest import FakeAimRun, make_run_config
 
 
 # ----------------------------------------------------------------------
@@ -395,19 +396,38 @@ class TestLifecycle:
         # After resume, _eval_start is back to 0
         assert cb._wall_time._eval_start == 0
 
-    def test_fit_end_closes_with_completed_status(self, fake_aim_run):
+    def test_fit_end_does_NOT_close_run_v112(self, fake_aim_run):
+        # v1.1.2 contract change: fit_end is now a lifecycle marker
+        # only; it does NOT close the Aim Run. This is the load-bearing
+        # fix for multi-fit trainings (e.g., the Muon→AdamW handoff)
+        # where the first fit_end firing used to null _run and cause
+        # every subsequent log_metrics to silently no-op. Real close
+        # moves to post_close. See _core.py / composer.py headers and
+        # the 2026-06-03 investigation.
         cb = AstrolabeComposerLogger()
         cb.init(state=None, logger_obj=None)
         run = cb._run
         cb.fit_end(state=None, logger_obj=None)
+        assert cb._run is run, "fit_end must NOT null _run (v1.1.2 fix)"
+        assert run.closed is False, "fit_end must NOT close the Aim Run (v1.1.2 fix)"
+        # Internal flag so post_close can pick the right status later.
+        assert getattr(cb, "_fit_end_seen", False) is True
+
+    def test_post_close_after_fit_end_marks_completed(self, fake_aim_run):
+        # Clean path: fit_end then post_close → status="completed".
+        cb = AstrolabeComposerLogger()
+        cb.init(state=None, logger_obj=None)
+        run = cb._run
+        cb.fit_end(state=None, logger_obj=None)
+        cb.post_close()
         assert run.tags["astrolabe.status"] == "completed"
         assert run.closed is True
         assert cb._run is None
 
-    def test_post_close_marks_failed_when_fit_end_skipped(self, fake_aim_run):
+    def test_post_close_without_fit_end_marks_failed(self, fake_aim_run):
         # If training crashes before fit_end fires, post_close still
-        # gets called by Composer's Trainer cleanup. This is our last
-        # chance to mark the run as failed.
+        # gets called by Composer's Trainer cleanup. fit_end never
+        # set the seen-flag, so status falls through to "failed".
         cb = AstrolabeComposerLogger()
         cb.init(state=None, logger_obj=None)
         run = cb._run
@@ -415,11 +435,128 @@ class TestLifecycle:
         assert run.tags["astrolabe.status"] == "failed"
         assert run.closed is True
 
-    def test_post_close_after_fit_end_is_noop(self, fake_aim_run):
-        # Idempotent: clean exit calls fit_end → close → _run=None.
-        # Composer then calls post_close; it should no-op.
+    def test_post_close_after_post_close_is_noop(self, fake_aim_run):
+        # Double-close guard: _run is None on second invocation.
         cb = AstrolabeComposerLogger()
         cb.init(state=None, logger_obj=None)
         cb.fit_end(state=None, logger_obj=None)
-        # post_close after fit_end must not raise or re-close.
+        cb.post_close()
+        # Second post_close must not raise or re-close.
         cb.post_close()  # _run is None at this point; no error
+
+
+# ============================================================
+# v1.1.2 diagnostic logging — disk-stats records that let
+# post-mortem distinguish between the five hypotheses for
+# "Aim drops mid-training but the buffer never wedged":
+#   H1: Composer fires fit_end mid-training, _run gets nulled
+#   H2: Composer's destination list mutates (we stop being called)
+#   H3: _to_scalar rejects specific values silently
+#   H4: Drainer thread silently dies
+#   H5: Aim server-side rejection (out of scope for callback tests)
+# ============================================================
+
+
+class TestDiagnosticLogs:
+    def _read_jsonl(self, path):
+        import json
+        if not path.exists():
+            return []
+        return [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+
+    def test_lifecycle_log_on_each_hook(self, fake_aim_run, monkeypatch, tmp_path):
+        """Every lifecycle hook fires a `kind=lifecycle` record. Pre-fix
+        we couldn't tell *when* fit_end fired vs init vs post_close.
+        Now each hook leaves a timestamped breadcrumb so the smoking-
+        gun timing question (did fit_end fire mid-training?) becomes
+        trivially answerable post-mortem."""
+        stats_file = tmp_path / "stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_file))
+
+        cb = AstrolabeComposerLogger()
+        cb.init(state=None, logger_obj=None)
+        cb.fit_start(state=None, logger_obj=None)
+        cb.fit_end(state=None, logger_obj=None)
+        cb.post_close()
+
+        records = self._read_jsonl(stats_file)
+        hooks = [r["hook"] for r in records if r.get("kind") == "lifecycle"]
+        assert hooks == ["init", "fit_start", "fit_end", "post_close"], (
+            f"lifecycle hooks not in expected order: {hooks}"
+        )
+
+    def test_log_metrics_called_counter_fires(self, fake_aim_run, monkeypatch, tmp_path):
+        """H2 detector: ``log_metrics_called`` records prove the
+        destination IS being called by Composer (vs Composer having
+        removed us from its list). Sampled at 1st + every 100th call."""
+        stats_file = tmp_path / "stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_file))
+
+        cb = AstrolabeComposerLogger()
+        cb.init(state=None, logger_obj=None)
+        # 105 calls → first + 100th = 2 records
+        for i in range(105):
+            cb.log_metrics({"train/loss": float(i)}, step=i)
+
+        records = self._read_jsonl(stats_file)
+        called = [r for r in records if r.get("kind") == "log_metrics_called"]
+        assert len(called) == 2, f"expected 1st + 100th call logged, got: {called}"
+        assert called[0]["total_calls"] == 1
+        assert called[1]["total_calls"] == 100
+        assert called[0]["run_is_none"] is False
+
+    def test_log_metrics_skipped_run_none_h1_smoking_gun(
+        self, fake_aim_run, monkeypatch, tmp_path
+    ):
+        """H1 smoking gun: ``log_metrics_skipped_run_none`` records
+        appear ONLY when ``log_metrics`` is called while ``_run is
+        None``. Pre-v1.1.2 this happened silently after fit_end nulled
+        _run. v1.1.2's fix prevents _run from being nulled in fit_end —
+        but if somehow it gets nulled anyway (external code, future
+        refactor regression), the records make it visible."""
+        stats_file = tmp_path / "stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_file))
+
+        cb = AstrolabeComposerLogger()
+        cb.init(state=None, logger_obj=None)
+        # Manually null _run to simulate the pre-v1.1.2 bug scenario.
+        cb._run = None
+        # Each call hits the guard and increments the skip counter.
+        for i in range(105):
+            cb.log_metrics({"train/loss": float(i)}, step=i)
+
+        records = self._read_jsonl(stats_file)
+        skipped = [r for r in records if r.get("kind") == "log_metrics_skipped_run_none"]
+        assert len(skipped) == 2, f"expected 1st + 100th skip logged, got: {skipped}"
+        assert skipped[0]["total_skips"] == 1
+        assert skipped[1]["total_skips"] == 100
+
+    def test_skip_to_scalar_h3_detector(self, fake_aim_run, monkeypatch, tmp_path):
+        """H3 detector: when _to_scalar rejects a value (non-numeric,
+        non-tensor, NaN, inf), record ``skip_to_scalar`` with the
+        metric name + value type. First per metric + every 100th."""
+        stats_file = tmp_path / "stats.jsonl"
+        monkeypatch.setenv("ASTROLABE_CALLBACK_STATS_PATH", str(stats_file))
+
+        cb = AstrolabeComposerLogger()
+        cb.init(state=None, logger_obj=None)
+        # Mix: dict (non-scalar), string (non-scalar) — both rejected.
+        # Real numeric metric mixed in to ensure the rejection is
+        # per-key not per-call.
+        cb.log_metrics({"weird/dict": {"a": 1}, "weird/str": "hello", "train/loss": 0.5})
+
+        records = self._read_jsonl(stats_file)
+        skips = [r for r in records if r.get("kind") == "skip_to_scalar"]
+        # First occurrence per metric — so two records (one per weird metric).
+        assert len(skips) == 2
+        metrics = {r["metric"]: r["value_type"] for r in skips}
+        assert metrics == {"weird/dict": "dict", "weird/str": "str"}, metrics
+        # And the numeric one made it through to the most-recently-opened run.
+        tracked = [t for t in fake_aim_run[-1].tracked if t["name"] == "train/loss"]
+        assert len(tracked) == 1
+        assert tracked[0]["value"] == 0.5
+
+
+# Note: TestSubmitSample + TestDrainerDeath moved to
+# test_metric_buffer.py — they need the real async drainer path,
+# which test_metric_buffer.py disables the autouse sync override for.

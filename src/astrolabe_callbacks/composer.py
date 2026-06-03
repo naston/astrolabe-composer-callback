@@ -143,12 +143,70 @@ class AstrolabeComposerLogger(LoggerDestination):
 
         Non-numeric values are silently skipped — Aim only accepts
         scalars. Tensors with ``.item()`` are unwrapped.
+
+        v1.1.2 instrumentation: counters + sampled disk-stats lines
+        let post-mortem diagnose whether Composer stopped calling us,
+        we skipped at the ``_run is None`` guard, or per-value
+        coercion stripped specific metrics. None of these were
+        visible before — silent path through the code.
         """
-        if not self._rank_zero or self._run is None or not metrics:
+        # Lazily init counters so existing instances keep working in
+        # tests / older constructors.
+        if not hasattr(self, "_log_metrics_calls"):
+            self._log_metrics_calls = 0
+            self._log_metrics_skipped_run_none = 0
+            self._scalar_skip_counts: dict[str, int] = {}
+
+        self._log_metrics_calls += 1
+        # Sample log: first call + every 100th. Distinguishes
+        # "Composer stopped calling us" from "Composer called us
+        # but we skipped". H2 detector.
+        if self._log_metrics_calls == 1 or self._log_metrics_calls % 100 == 0:
+            _core._append_stats_line(
+                kind="log_metrics_called",
+                total_calls=self._log_metrics_calls,
+                run_is_none=(self._run is None),
+                metrics_size=len(metrics) if metrics else 0,
+                step=step,
+            )
+
+        if not self._rank_zero:
             return
+        if not metrics:
+            return
+        if self._run is None:
+            # H1 smoking gun: log_metrics called WITH metrics but
+            # _run got nulled. Pre-v1.1.2 fix this was the silent
+            # cliff. Post-fix this should not happen — but log if it
+            # does so we know the fix didn't take.
+            self._log_metrics_skipped_run_none += 1
+            if (self._log_metrics_skipped_run_none == 1
+                    or self._log_metrics_skipped_run_none % 100 == 0):
+                _core._append_stats_line(
+                    kind="log_metrics_skipped_run_none",
+                    total_skips=self._log_metrics_skipped_run_none,
+                    sample_metric_keys=list(metrics.keys())[:3],
+                    step=step,
+                )
+            return
+
         for raw_name, value in metrics.items():
             scalar = _to_scalar(value)
             if scalar is None:
+                # H3 detector: which specific metric values does
+                # _to_scalar reject? Log first occurrence per metric
+                # name + every 100th to cap disk write volume.
+                name = _normalize_composer_metric_name(raw_name)
+                cnt = self._scalar_skip_counts.get(name, 0) + 1
+                self._scalar_skip_counts[name] = cnt
+                if cnt == 1 or cnt % 100 == 0:
+                    _core._append_stats_line(
+                        kind="skip_to_scalar",
+                        metric=name,
+                        value_type=type(value).__name__,
+                        per_metric_skips=cnt,
+                        step=step,
+                    )
                 continue
             name = _normalize_composer_metric_name(raw_name)
             _core.track_safely(
@@ -172,6 +230,7 @@ class AstrolabeComposerLogger(LoggerDestination):
 
     def init(self, state: Any, logger_obj: Any) -> None:
         """Open the Aim run and apply astrolabe tags."""
+        _core._append_stats_line(kind="lifecycle", hook="init", run_hash=None)
         if not self._rank_zero:
             return
         if self._run is not None:
@@ -179,6 +238,31 @@ class AstrolabeComposerLogger(LoggerDestination):
 
         run_name = getattr(state, "run_name", None)
         self._run = _core.open_aim_run(self._cfg, run_name=run_name)
+
+    def fit_start(self, state: Any, logger_obj: Any) -> None:
+        """Lifecycle marker + defensive reopen.
+
+        New in v1.1.2. If ``_run`` is somehow ``None`` at fit_start
+        (e.g., a previous ``fit_end`` closed it because of pre-v1.1.2
+        behavior, or an external caller closed it), reopen rather than
+        silently no-op the entire fit. Pairs with the v1.1.2 change to
+        ``fit_end`` that no longer nulls ``_run``.
+        """
+        run_hash = getattr(self._run, "hash", None) if self._run is not None else None
+        _core._append_stats_line(
+            kind="lifecycle", hook="fit_start",
+            run_hash=run_hash[:12] if run_hash else None,
+        )
+        if not self._rank_zero:
+            return
+        if self._run is None:
+            run_name = getattr(state, "run_name", None)
+            self._run = _core.open_aim_run(self._cfg, run_name=run_name)
+            _core._append_stats_line(
+                kind="run_reopened",
+                reason="fit_start_with_run_none",
+                new_run_hash=getattr(self._run, "hash", "?")[:12] if self._run else None,
+            )
 
     def eval_start(self, state: Any, logger_obj: Any) -> None:
         """Pause wall-time accounting during eval."""
@@ -216,23 +300,49 @@ class AstrolabeComposerLogger(LoggerDestination):
         self._wall_time.resume()
 
     def fit_end(self, state: Any, logger_obj: Any) -> None:
-        """Close the Aim run cleanly."""
-        if not self._rank_zero:
-            return
-        _core.close_run(self._run, status="completed")
-        self._run = None
+        """Lifecycle marker — does NOT close the Aim run.
+
+        v1.1.2 change: pre-fix, this method called ``close_run`` and
+        set ``self._run = None``. That was correct for the
+        one-trainer-one-fit case but silently broke multi-fit
+        trainings (e.g., the Muon→AdamW handoff): the first fit_end
+        nulled _run, every subsequent log_metrics hit the
+        ``_run is None`` guard and returned silently, the second
+        phase's metrics never reached the buffer (or Aim). TB kept
+        writing in parallel because it has no equivalent guard.
+
+        Now: fit_end is a lifecycle marker only. The actual close
+        runs at ``post_close`` (Composer's trainer-destruction hook)
+        which fires exactly once per Trainer lifetime, regardless of
+        how many fit() calls happened in between. See callbacks
+        CHANGELOG entry for v1.1.2 + the 2026-06-03 investigation.
+        """
+        run_hash = getattr(self._run, "hash", None) if self._run is not None else None
+        _core._append_stats_line(
+            kind="lifecycle", hook="fit_end",
+            run_hash=run_hash[:12] if run_hash else None,
+        )
+        self._fit_end_seen = True
 
     def post_close(self) -> None:
         """LoggerDestination hook fired during Trainer cleanup.
 
-        Composer calls this even on training failures, so it's our
-        last-ditch chance to mark a run as failed if ``fit_end``
-        didn't fire. Idempotent; if ``fit_end`` already closed the run
-        cleanly, ``self._run`` is ``None`` and this no-ops.
+        v1.1.2 — this is now the SOLE close path. Status is
+        ``completed`` if at least one ``fit_end`` was seen (training
+        ran to completion at least once), else ``failed`` (trainer
+        torn down without ever finishing a fit). Idempotent on
+        ``_run is None``.
         """
+        run_hash = getattr(self._run, "hash", None) if self._run is not None else None
+        _core._append_stats_line(
+            kind="lifecycle", hook="post_close",
+            run_hash=run_hash[:12] if run_hash else None,
+            fit_end_seen=getattr(self, "_fit_end_seen", False),
+        )
         if not self._rank_zero or self._run is None:
             return
-        _core.close_run(self._run, status="failed")
+        status = "completed" if getattr(self, "_fit_end_seen", False) else "failed"
+        _core.close_run(self._run, status=status)
         self._run = None
 
 
