@@ -106,6 +106,9 @@ class AstrolabeHFTrainerCallback(TrainerCallback):
         self._run: Any = None
         self._wall_time = _core.WallTimeTracker()
         self._rank_zero = is_rank_zero()
+        # Schema-phase: tracks metric names registered via close+reopen
+        # cycles so the NUC sync sidecar's reader can see ``typed_traces``.
+        self._schema_state = _core.SchemaPhaseState()
 
     # ------------------------------------------------------------------
     # HF Trainer hooks
@@ -176,17 +179,26 @@ class AstrolabeHFTrainerCallback(TrainerCallback):
             name = _normalize_log_key(key)
             if name is None:
                 continue
+            _core.observe_name(self._schema_state, name)
             _core.track_safely(
                 self._run, name=name, value=value_float, step=step
             )
 
         # wall_time is part of the `train/` namespace conceptually but
         # gets its own write per log call.
+        _core.observe_name(self._schema_state, "wall_time")
         _core.track_safely(
             self._run,
             name="wall_time",
             value=self._wall_time.elapsed(),
             step=step,
+        )
+
+        # Schema-phase finalize: registers any new metric names seen
+        # in this log batch. On batch 1 this captures train metrics;
+        # cheap no-op when nothing new.
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
         )
 
     def on_evaluate(
@@ -219,9 +231,16 @@ class AstrolabeHFTrainerCallback(TrainerCallback):
             name = _normalize_log_key(key)
             if name is None:
                 continue
+            _core.observe_name(self._schema_state, name)
             _core.track_safely(
                 self._run, name=name, value=value_float, step=step
             )
+
+        # Eval metrics typically first appear here; finalize so they
+        # go live within the next sync cycle.
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
+        )
 
     def on_train_end(
         self, args: Any, state: Any, control: Any, **kwargs: Any

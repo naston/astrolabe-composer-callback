@@ -102,6 +102,11 @@ class AstrolabeRun:
         self._wall_time = _core.WallTimeTracker()
         self._rank_zero = is_rank_zero()
         self._closed = False
+        # Schema-phase: ``log_train``/``log_eval`` auto-trigger a
+        # finalize cycle whenever new metric names have appeared.
+        # Cheap no-op when nothing new. Users wanting explicit control
+        # can call ``finalize_schema()`` directly.
+        self._schema_state = _core.SchemaPhaseState()
 
     @property
     def is_active(self) -> bool:
@@ -156,14 +161,20 @@ class AstrolabeRun:
             return
         self._wall_time.mark_first_batch()
         for name, value in metrics.items():
+            fullname = f"train/{name}"
+            _core.observe_name(self._schema_state, fullname)
             _core.track_safely(
-                self._run, name=f"train/{name}", value=value, step=step
+                self._run, name=fullname, value=value, step=step
             )
+        _core.observe_name(self._schema_state, "wall_time")
         _core.track_safely(
             self._run,
             name="wall_time",
             value=self._wall_time.elapsed(),
             step=step,
+        )
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
         )
 
     def log_eval(self, *, step: int | None = None, **metrics: float) -> None:
@@ -187,12 +198,17 @@ class AstrolabeRun:
         if not self.is_active:
             return
         for name, value in metrics.items():
+            fullname = f"{_core.EVAL_METRIC_PREFIX}/{name}"
+            _core.observe_name(self._schema_state, fullname)
             _core.track_safely(
                 self._run,
-                name=f"{_core.EVAL_METRIC_PREFIX}/{name}",
+                name=fullname,
                 value=value,
                 step=step,
             )
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
+        )
 
     def log(
         self,
@@ -223,8 +239,34 @@ class AstrolabeRun:
         """
         if not self.is_active:
             return
+        _core.observe_name(self._schema_state, name)
         _core.track_safely(
             self._run, name=name, value=value, step=step, context=context
+        )
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
+        )
+
+    def finalize_schema(self) -> None:
+        """Manually trigger a schema-phase finalize.
+
+        Drains the metric buffer, closes the Aim run, and reopens it
+        with ``force_resume=True``. This flushes RocksDB memtable
+        contents to stable SST files so the NUC-side sync sidecar
+        can see ``typed_traces`` entries for all metrics observed so
+        far — making them visible to the dashboard via the next sync
+        cycle.
+
+        Auto-triggered by ``log_train``, ``log_eval``, ``log`` (no-op
+        when no new names since last finalize). Users only need to
+        call this explicitly when they want a forced flush at a
+        specific point — e.g., after a hand-rolled "warmup" phase
+        that registers every metric upfront.
+        """
+        if not self.is_active:
+            return
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
         )
 
     def set_tag(self, name: str, value: str) -> None:

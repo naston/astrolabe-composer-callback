@@ -117,6 +117,10 @@ class AstrolabeLightningLogger(Callback):
         self._step = 0
         self._wall_time = _core.WallTimeTracker()
         self._rank_zero = is_rank_zero()
+        # Schema-phase: tracks metric names registered via close+reopen
+        # cycles so the NUC sync sidecar's read-only reader can see
+        # ``typed_traces`` for all metrics in stable SST files.
+        self._schema_state = _core.SchemaPhaseState()
 
     # ------------------------------------------------------------------
     # Lightning hooks
@@ -176,6 +180,7 @@ class AstrolabeLightningLogger(Callback):
             scalar = _to_scalar(value)
             if scalar is None:
                 continue
+            _core.observe_name(self._schema_state, raw_name)
             _core.track_safely(
                 self._run,
                 name=raw_name,
@@ -183,11 +188,19 @@ class AstrolabeLightningLogger(Callback):
                 step=self._step,
             )
 
+        _core.observe_name(self._schema_state, "wall_time")
         _core.track_safely(
             self._run,
             name="wall_time",
             value=self._wall_time.elapsed(),
             step=self._step,
+        )
+
+        # Schema-phase finalize check: at batch 1's end, registers
+        # all of batch 0's observed names. Subsequent batches with
+        # no new names are a cheap no-op.
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
         )
 
     def on_validation_start(self, trainer: Any, pl_module: Any) -> None:
@@ -221,12 +234,21 @@ class AstrolabeLightningLogger(Callback):
             scalar = _to_scalar(value)
             if scalar is None:
                 continue
+            name = f"{_core.EVAL_METRIC_PREFIX}/{clean}"
+            _core.observe_name(self._schema_state, name)
             _core.track_safely(
                 self._run,
-                name=f"{_core.EVAL_METRIC_PREFIX}/{clean}",
+                name=name,
                 value=scalar,
                 step=self._step,
             )
+
+        # Eval metrics typically first appear here, after batch 0's
+        # finalize. Pick them up so the dashboard goes live for them
+        # within the next sync cycle.
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
+        )
 
     def on_train_end(self, trainer: Any, pl_module: Any) -> None:
         """Close the Aim run cleanly at end of training."""

@@ -123,6 +123,13 @@ class AstrolabeComposerLogger(LoggerDestination):
         self._run: Any = None
         self._wall_time = _core.WallTimeTracker()
         self._rank_zero = is_rank_zero()
+        # Schema-phase: tracks which metric names have been registered
+        # via a close-and-reopen cycle so the NUC-side sync sidecar
+        # can see them in stable SST files (not just memtable). The
+        # cycle fires at framework boundary hooks via
+        # ``_core.maybe_finalize_schema`` whenever new names have
+        # appeared since the previous finalize.
+        self._schema_state = _core.SchemaPhaseState()
 
     # ------------------------------------------------------------------
     # LoggerDestination metric hooks — pass through everything
@@ -209,6 +216,7 @@ class AstrolabeComposerLogger(LoggerDestination):
                     )
                 continue
             name = _normalize_composer_metric_name(raw_name)
+            _core.observe_name(self._schema_state, name)
             _core.track_safely(
                 self._run, name=name, value=scalar, step=step
             )
@@ -271,12 +279,18 @@ class AstrolabeComposerLogger(LoggerDestination):
         self._wall_time.pause_for_eval()
 
     def batch_end(self, state: Any, logger_obj: Any) -> None:
-        """Anchor wall-time at first training batch + log it.
+        """Anchor wall-time at first training batch + log it, then
+        check whether a schema-phase finalize is due.
 
         Composer's auto-logged train metrics flow through ``log_metrics``
         (called by Composer's Logger before this hook on the same
         batch), so this hook only handles the synthesized ``wall_time``
         metric. The first call also anchors the wall-time clock.
+
+        After the wall_time write, ``_core.maybe_finalize_schema`` runs.
+        On batch 1 (first time around), this is the schema-phase
+        finalize that registers all of batch 0's observed metric names.
+        On subsequent batches with no new names, it's a cheap no-op.
         """
         if not self._rank_zero or self._run is None:
             return
@@ -286,6 +300,7 @@ class AstrolabeComposerLogger(LoggerDestination):
             step = int(state.timestamp.batch)
         except Exception:
             step = None
+        _core.observe_name(self._schema_state, "wall_time")
         _core.track_safely(
             self._run,
             name="wall_time",
@@ -293,11 +308,30 @@ class AstrolabeComposerLogger(LoggerDestination):
             step=step,
         )
 
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
+        )
+
     def eval_end(self, state: Any, logger_obj: Any) -> None:
-        """Resume wall-time accounting after eval."""
+        """Resume wall-time accounting after eval, then check whether
+        eval introduced any new metric names that need a schema-phase
+        finalize.
+
+        Eval metrics (``val/loss``, ``val/accuracy``, ...) typically
+        first appear at this hook, after batch 0's finalize has
+        already happened. The maybe_finalize_schema call here picks
+        them up and registers them so they go live on the dashboard
+        within the next sync cycle.
+        """
         # Resume even if logging was disabled — accounting must be
         # right for the next batch_end.
         self._wall_time.resume()
+
+        if not self._rank_zero or self._run is None:
+            return
+        self._run = _core.maybe_finalize_schema(
+            self._run, self._schema_state, cfg=self._cfg
+        )
 
     def fit_end(self, state: Any, logger_obj: Any) -> None:
         """Lifecycle marker — does NOT close the Aim run.

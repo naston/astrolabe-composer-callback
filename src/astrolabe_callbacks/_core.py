@@ -47,9 +47,12 @@ __all__ = [
     "EVAL_METRIC_PREFIX",
     "DEFAULT_AIM_URL",
     "RunConfig",
+    "SchemaPhaseState",
     "WallTimeTracker",
     "close_run",
     "is_strict",
+    "maybe_finalize_schema",
+    "observe_name",
     "open_aim_run",
     "parse_aim_run_tags",
     "resolve_run_config",
@@ -674,14 +677,45 @@ def open_aim_run(cfg: RunConfig, *, run_name: str | None = None) -> Any:
         logger.warning(msg)
         return None
 
+    # If the engine has set ASTROLABE_AIM_REPO_PATH, start a local
+    # aim server (subprocess) on this host before opening the Run.
+    # The callback then connects to it via cfg.aim_url (typically
+    # aim://localhost:43800). Producer-side writes stay on localhost
+    # — no SSH in the hot path. The NUC-side sync sidecar pulls
+    # chunks via SSH+rsync on its own cadence.
+    #
+    # When ASTROLABE_AIM_REPO_PATH is unset, behavior matches v1.x:
+    # the callback just connects to whatever aim_url points to
+    # (the engine's reverse-SSH-tunneled remote aim server).
+    local_server = _maybe_start_local_aim_server(cfg)
+
     try:
         run = Run(repo=cfg.aim_url, experiment=cfg.experiment_name)
     except Exception as exc:
         msg = f"Aim connection to {cfg.aim_url} failed: {exc}"
         if is_strict():
+            if local_server is not None:
+                _stop_local_aim_server(local_server)
             raise RuntimeError(msg) from exc
         logger.warning(msg + " — callback degrading to no-op.")
+        if local_server is not None:
+            _stop_local_aim_server(local_server)
         return None
+
+    # Attach the local server handle to the Run so close_run can
+    # shut it down when training finishes. Best-effort attribute
+    # write; if Aim's Run rejects setattr, we still keep the
+    # reference but lose graceful shutdown (the subprocess gets
+    # cleaned up via the atexit handler installed in
+    # _maybe_start_local_aim_server).
+    if local_server is not None:
+        try:
+            run._astrolabe_local_server = local_server
+        except Exception as exc:
+            logger.debug(
+                "couldn't attach local_server to Run (atexit handler will clean up): {}",
+                exc,
+            )
 
     # Run.name carries through to the dashboard so researchers see the
     # meaningful name (e.g. "bert-tiny") instead of the auto-generated
@@ -808,6 +842,13 @@ def close_run(run: Any, *, status: str = "completed") -> None:
         logger.info("Aim run finalized (status={})", status)
     except Exception as exc:
         logger.debug("Aim run close failed: {}", exc)
+
+    # If we started a local aim server in open_aim_run, shut it down
+    # gracefully now. The subprocess writes a final SST flush on
+    # SIGTERM. Cleanup is idempotent — re-calls return immediately.
+    local_server = getattr(run, "_astrolabe_local_server", None)
+    if local_server is not None:
+        _stop_local_aim_server(local_server)
 
 
 def track_safely(
@@ -940,3 +981,431 @@ class WallTimeTracker:
         if self._start_time == 0.0:
             return 0.0
         return (time.monotonic() - self._start_time) - self._total_eval_time
+
+
+# Schema-phase machinery. Live-visibility on the dashboard requires the
+# per-run RocksDB to have all metric ``typed_traces`` entries durably in
+# SST files (memtable contents are invisible to read-only opens from
+# other processes). Aim flushes memtable on Run.close() — so the callback
+# does a close + reopen-with-force_resume cycle to push the schema into
+# SSTs, then the NUC-side sync sidecar picks it up via rsync within a
+# couple seconds.
+#
+# Trigger model: continuous observation of metric names from log_metrics,
+# finalize at framework "boundary" hooks (batch_end, eval_end, epoch_end)
+# whenever new names have appeared since the previous finalize. Idempotent
+# and cheap when there's nothing to do. Capped at ``max_finalizes`` so a
+# misbehaving callback that sprays conditional metrics across many
+# boundaries can't churn schema-phase forever.
+#
+# Failure mode after the cap (or if reopen fails): we keep the existing
+# Run and continue writes. Late-arriving metrics fall back to "visible at
+# close, not live" — acceptable degradation. The buffer's existing
+# track-failure path handles the post-failure writes gracefully.
+_DEFAULT_MAX_FINALIZES = 10
+
+
+# Local aim server lifecycle. When the engine sets
+# ``ASTROLABE_AIM_REPO_PATH`` on the compute host, the callback
+# starts an aim transport server subprocess bound to the host:port
+# from cfg.aim_url, writing to that repo path. The hot path
+# (training metric writes) then stays on localhost — no SSH per
+# write. The NUC-side sync sidecar pulls chunks from this repo
+# via SSH+rsync on its own cadence.
+#
+# The "start" function is best-effort: any failure (binary missing,
+# port already taken, init fails) logs a warning and returns None;
+# the callback falls back to direct-connect to whatever aim_url
+# pointed at (legacy behavior). Strict mode raises.
+_LOCAL_SERVER_STARTUP_TIMEOUT_S = 10.0
+_LOCAL_SERVER_SHUTDOWN_TIMEOUT_S = 15.0
+
+
+def _parse_aim_url_host_port(aim_url: str) -> tuple[str, int] | None:
+    """Extract (host, port) from an ``aim://host:port`` URL.
+
+    Returns None on any malformed input. The local-server helper
+    skips startup when the URL can't be parsed (logs a debug message;
+    not strict-mode-promoting since a remote URL is a valid choice).
+    """
+    if not aim_url.startswith("aim://"):
+        return None
+    host_port = aim_url[len("aim://"):].split("/", 1)[0]
+    if ":" not in host_port:
+        return None
+    host, port_str = host_port.rsplit(":", 1)
+    try:
+        port = int(port_str)
+    except ValueError:
+        return None
+    if not host or port <= 0:
+        return None
+    return host, port
+
+
+def _maybe_start_local_aim_server(cfg: "RunConfig") -> Any:
+    """Start a local ``aim server`` subprocess if requested by env.
+
+    Triggered by ``ASTROLABE_AIM_REPO_PATH``. The callback will then
+    connect to ``cfg.aim_url`` (typically ``aim://localhost:43800``)
+    — but the server it talks to is the local subprocess we just
+    started, not a remote one.
+
+    The subprocess is registered via ``atexit`` for cleanup on
+    interpreter shutdown, so even an unhandled exception in the
+    training loop leaves no orphaned aim server.
+
+    Parameters
+    ----------
+    cfg : RunConfig
+        The resolved config. ``cfg.aim_url`` provides host:port.
+
+    Returns
+    -------
+    subprocess.Popen | None
+        The Popen handle for the running aim server, or ``None`` if
+        the env var wasn't set, the URL couldn't be parsed, or
+        startup failed.
+    """
+    import atexit
+    import socket
+    import subprocess
+    from pathlib import Path
+
+    repo_path = os.environ.get("ASTROLABE_AIM_REPO_PATH")
+    if not repo_path:
+        return None
+
+    host_port = _parse_aim_url_host_port(cfg.aim_url)
+    if host_port is None:
+        logger.warning(
+            "ASTROLABE_AIM_REPO_PATH is set but cfg.aim_url={!r} is not a "
+            "parseable aim://host:port — skipping local server startup.",
+            cfg.aim_url,
+        )
+        return None
+    host, port = host_port
+
+    repo = Path(repo_path)
+    repo.mkdir(parents=True, exist_ok=True)
+    # Initialize the Aim repo if not already initialized. ``aim init``
+    # is idempotent. We tolerate failure (assume already initialized).
+    if not (repo / ".aim").exists():
+        try:
+            subprocess.run(
+                ["aim", "init", "--repo", str(repo)],
+                check=True,
+                capture_output=True,
+                timeout=10.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "aim init at {} failed: {} — skipping local server startup.",
+                repo,
+                exc,
+            )
+            return None
+
+    # Spawn the aim server. stdout/stderr → DEVNULL so the training
+    # process's output stays clean; engine-side observability comes
+    # from the sync sidecar's log (which is the real signal anyway).
+    try:
+        proc = subprocess.Popen(
+            [
+                "aim",
+                "server",
+                "--host", host,
+                "--port", str(port),
+                "--repo", str(repo),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("local aim server failed to spawn: {}", exc)
+        return None
+
+    # Wait for the port to be listening. Aim server takes 1-3s to
+    # come up depending on host load. We poll quickly with a budget.
+    deadline = time.monotonic() + _LOCAL_SERVER_STARTUP_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            # Process exited before listening — startup failure.
+            logger.warning(
+                "local aim server exited prematurely with code {} (host={}, port={}, repo={})",
+                proc.returncode,
+                host,
+                port,
+                repo,
+            )
+            return None
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                logger.info(
+                    "local aim server started at aim://{}:{} (pid {}, repo {})",
+                    host,
+                    port,
+                    proc.pid,
+                    repo,
+                )
+                # Register atexit cleanup as a safety net in case
+                # close_run is never called (training process crashes
+                # without invoking post_close).
+                atexit.register(_stop_local_aim_server, proc)
+                return proc
+        except OSError:
+            time.sleep(0.2)
+
+    # Timeout — kill the subprocess and give up.
+    logger.warning(
+        "local aim server did not start within {}s; killing.",
+        _LOCAL_SERVER_STARTUP_TIMEOUT_S,
+    )
+    _stop_local_aim_server(proc)
+    return None
+
+
+def _stop_local_aim_server(proc: Any) -> None:
+    """Send SIGTERM to the aim server subprocess and wait for exit.
+
+    Idempotent — safe to call multiple times (atexit + close_run).
+    Aim server's RocksDB shutdown handler flushes memtable to SST
+    on SIGTERM, so the final sync after this call has all the
+    typed_traces visible.
+
+    On timeout, escalates to SIGKILL — the next sync cycle's data
+    may be incomplete, but the cleanup completes.
+    """
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return  # already exited
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=_LOCAL_SERVER_SHUTDOWN_TIMEOUT_S)
+            logger.info("local aim server (pid {}) shut down cleanly", proc.pid)
+        except Exception:
+            logger.warning(
+                "local aim server (pid {}) did not exit within {}s — killing",
+                proc.pid,
+                _LOCAL_SERVER_SHUTDOWN_TIMEOUT_S,
+            )
+            proc.kill()
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+    except Exception as exc:  # noqa: BLE001 — cleanup must not raise
+        logger.debug("local aim server cleanup error (ignored): {}", exc)
+
+
+@dataclass
+class SchemaPhaseState:
+    """Tracks observed and registered metric names for schema-phase finalize.
+
+    Attributes
+    ----------
+    observed_names : set[str]
+        Names seen via ``observe_name`` since the run started. Grows over
+        time as the callback's ``log_metrics`` (or equivalent) observes
+        new metric names.
+    registered_names : set[str]
+        Names that have been included in a completed
+        ``maybe_finalize_schema`` cycle. After a successful finalize, the
+        observed_names set is unioned into this.
+    finalize_count : int
+        Number of finalize cycles performed so far. Capped at
+        ``max_finalizes`` to prevent pathological churn.
+    max_finalizes : int
+        Safety bound; default 10. After this, ``maybe_finalize_schema``
+        is a no-op even if new names appear (they degrade to
+        "visible at run close").
+    """
+
+    observed_names: set[str] = field(default_factory=set)
+    registered_names: set[str] = field(default_factory=set)
+    finalize_count: int = 0
+    max_finalizes: int = _DEFAULT_MAX_FINALIZES
+
+
+def observe_name(state: SchemaPhaseState, name: str) -> None:
+    """Record a metric name as observed.
+
+    Cheap set add. Called from the callback's per-metric write path
+    (Composer ``log_metrics``, Lightning ``log``, etc.) on every metric
+    name the framework hands us — before or after the actual track call,
+    doesn't matter for the schema-phase logic.
+
+    Parameters
+    ----------
+    state : SchemaPhaseState
+        The callback's schema-phase state.
+    name : str
+        Metric name (post-normalization if the framework callback does
+        any rename — pass the same name that will be used in ``track``).
+    """
+    state.observed_names.add(name)
+
+
+def maybe_finalize_schema(run: Any, state: SchemaPhaseState, *, cfg: RunConfig) -> Any:
+    """If new metric names have been observed since the last finalize,
+    drain the buffer, close the Run, and reopen with ``force_resume`` so
+    the new ``typed_traces`` land in stable SST files.
+
+    Called from framework callback boundary hooks (Composer ``batch_end``,
+    ``eval_end``, ``epoch_end``; Lightning equivalents; HuggingFace
+    equivalents). Cheap no-op when there's nothing to do, so safe to call
+    every boundary.
+
+    Idempotent. Thread-safe by virtue of being called from synchronous
+    framework hooks; no internal locking.
+
+    Parameters
+    ----------
+    run : aim.Run | None
+        The currently open Aim run. If ``None`` (callback degraded to
+        no-op mode), the function is a no-op and returns ``None``.
+    state : SchemaPhaseState
+        The callback's schema-phase state. Mutated in place on success
+        (registered_names grows, finalize_count increments).
+    cfg : RunConfig
+        The resolved config used to open ``run`` — needed to reopen via
+        ``Run(run_hash=..., repo=cfg.aim_url, force_resume=True)``.
+
+    Returns
+    -------
+    aim.Run | None
+        The new Run object after reopen, or the same Run unchanged if
+        there were no new names to register / the safety cap was hit /
+        the reopen failed. The caller (framework callback) should
+        reassign its ``self._run`` to the return value.
+    """
+    if run is None:
+        return None
+
+    new = state.observed_names - state.registered_names
+    if not new:
+        # Cheap path: nothing to do.
+        return run
+
+    if state.finalize_count >= state.max_finalizes:
+        # Safety cap: log once when first crossed (use a sentinel on
+        # state itself to rate-limit). Beyond this, late-arriving
+        # metrics fall back to "visible at close, not live".
+        if not getattr(state, "_max_finalizes_logged", False):
+            logger.warning(
+                "Schema-phase: hit max_finalizes={} cap with {} unregistered "
+                "metric names still observed. Further metric registrations "
+                "will only be visible at run close.",
+                state.max_finalizes,
+                len(new),
+            )
+            state._max_finalizes_logged = True  # type: ignore[attr-defined]
+            _append_stats_line(
+                kind="schema_max_finalizes_hit",
+                finalize_count=state.finalize_count,
+                unregistered_metric_count=len(new),
+            )
+        return run
+
+    run_hash = getattr(run, "hash", None)
+    if run_hash is None:
+        logger.warning("Schema-phase: run has no hash; skipping finalize.")
+        return run
+
+    # Drain the existing buffer so its in-flight writes commit to the
+    # current Run before close. Without this, queued writes would be
+    # lost when we close + reopen.
+    buffer = getattr(run, "_astrolabe_buffer", None)
+    if buffer is not None:
+        try:
+            unflushed = buffer.close(timeout_s=_DEFAULT_DRAIN_TIMEOUT_S)
+            if unflushed:
+                logger.warning(
+                    "Schema-phase: {} items unflushed at pre-finalize drain; "
+                    "they will appear under the original Run.",
+                    unflushed,
+                )
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully
+            logger.debug("Schema-phase: buffer drain failed: {}", exc)
+
+    # Close the current Run. This forces RocksDB to flush memtable
+    # contents to SST files — the typed_traces entries the sync sidecar
+    # needs to see.
+    try:
+        run.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Schema-phase: run.close() failed: {}", exc)
+        _append_stats_line(
+            kind="schema_close_failed",
+            exception=repr(exc)[:200],
+            finalize_count=state.finalize_count,
+        )
+        return run  # degrade: keep the (now-broken) run, writes will fail gracefully
+
+    # Reopen with the same hash via force_resume. Aim will replay any
+    # remaining WAL into the newly opened memtable.
+    try:
+        from aim import Run as _Run
+    except ImportError:
+        logger.warning("Schema-phase: aim not importable on reopen.")
+        return run
+
+    try:
+        new_run = _Run(
+            run_hash=run_hash,
+            repo=cfg.aim_url,
+            force_resume=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Schema-phase: Run reopen failed (run_hash={}): {} — "
+            "writes after this point will silently fail until next run.",
+            run_hash[:12] if isinstance(run_hash, str) else run_hash,
+            exc,
+        )
+        _append_stats_line(
+            kind="schema_reopen_failed",
+            run_hash=run_hash[:12] if isinstance(run_hash, str) else None,
+            exception=repr(exc)[:200],
+            finalize_count=state.finalize_count,
+        )
+        return run  # caller's self._run is now the closed Run; track_safely will skip
+
+    # Reattach a fresh metric buffer to the new Run. The old buffer is
+    # closed (drainer thread exits cleanly); GC will release it.
+    try:
+        new_run._astrolabe_buffer = _MetricBuffer(new_run)
+    except Exception as exc:
+        logger.debug(
+            "Schema-phase: couldn't attach metric buffer (writes will be synchronous): {}",
+            exc,
+        )
+
+    # Mark the new names as registered. ``observed_names`` continues to
+    # grow with future observe_name calls; the diff against this set
+    # determines whether the next maybe_finalize_schema does work.
+    state.registered_names |= new
+    state.finalize_count += 1
+
+    logger.info(
+        "Schema-phase: finalized #{} — {} new metric names registered "
+        "({} total registered).",
+        state.finalize_count,
+        len(new),
+        len(state.registered_names),
+    )
+    _append_stats_line(
+        kind="schema_finalized",
+        finalize_count=state.finalize_count,
+        new_metric_count=len(new),
+        # Capped sample so post-mortem can see which kinds of metrics
+        # caused the finalize (handoff → lr-NewOptimizer/* vs sparse
+        # callback → some_metric_name). Capped to keep one finalize
+        # of a 200-metric OptimizerMonitor from bloating the line.
+        new_metric_names=sorted(new)[:10],
+        total_registered=len(state.registered_names),
+    )
+
+    return new_run
