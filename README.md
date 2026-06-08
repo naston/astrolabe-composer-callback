@@ -113,10 +113,32 @@ All four callbacks read the same environment variables. Astrolabe sets them auto
 | `ASTROLABE_EXPERIMENT_NAME` | Aim experiment name | constructor arg or `None` |
 | `ASTROLABE_AIM_URL` | Aim tracking URL | `aim://localhost:43800` |
 | `AIM_RUN_TAGS` | Tags applied to the run, format `k1=v1,k2=v2` | constructor arg or empty |
+| `ASTROLABE_AIM_REPO_PATH` | When set (v2.0+), callback starts a local `aim server` on the compute host writing to this path. NUC-side `astrolabe-sync` sidecar pulls chunks from here every ~3s. Unset = legacy reverse-SSH-tunnel mode. | unset (tunnel mode) |
 | `ASTROLABE_CALLBACK_STRICT` | `1` to raise on Aim failures instead of degrading | unset (graceful degrade) |
 | `RANK` / `LOCAL_RANK` | Distributed rank (set by `torchrun`) | rank-zero |
 
 **Env wins over constructor args.** Astrolabe is the orchestrator — its identity is authoritative. Constructor args are the standalone fallback.
+
+### Transport modes (v2.0+)
+
+Two transport modes are supported:
+
+- **Tunnel mode (default)**: callback connects directly to the NUC's Aim server via the engine-managed reverse SSH tunnel at `aim://localhost:43800`. Simple, ~40 writes/sec ceiling under realistic emission patterns due to per-call SSH framing overhead.
+- **Local-aim mode (opt-in, NUC sets `ASTROLABE_AIM_REPO_PATH`)**: callback starts a local `aim server` subprocess on the compute host. Writes stay on localhost (~1900 writes/sec). The NUC-side `astrolabe-sync` sidecar pulls per-run chunks every ~3s via SSH+rsync.
+
+The mode is selected by the engine, not by the callback. Researchers don't change anything in training code — both modes use the same callback API.
+
+See [astrolabe's `docs/aim-live-sync.md`](https://github.com/naston/astrolabe/blob/main/docs/aim-live-sync.md) for operational details (NUC admin facing).
+
+### Schema-phase finalize (v2.0+, automatic)
+
+In local-aim mode, the dashboard reads from RocksDB SST files on the NUC's central repo. Metric names sit in RocksDB memtable until `Run.close()` forces a flush — so without intervention, a separate-process reader can't enumerate metrics until the run ends.
+
+The callback handles this automatically: at framework boundary hooks (`batch_end`, `eval_end`, etc.), if any new metric names have been observed since the last finalize, the callback drains the metric buffer, closes the Run, and reopens with `force_resume=True`. The close forces memtable → SST flush; the rsync sidecar picks up the new chunks; the dashboard goes live.
+
+Typical Composer run has 1-2 finalize cycles (training metrics at batch 1, eval metrics on first eval). Optimizer handoffs trigger an additional finalize when the new optimizer's metrics first appear. Capped at 10 finalizes per run; pathological churn beyond that degrades to "visible at close."
+
+No researcher action required.
 
 ## Failure handling
 

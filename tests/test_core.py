@@ -8,6 +8,7 @@ that env-var precedence, AIM_RUN_TAGS parsing, etc. work correctly.
 from __future__ import annotations
 
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -15,9 +16,12 @@ from astrolabe_callbacks._core import (
     DEFAULT_AIM_URL,
     EVAL_METRIC_PREFIX,
     RunConfig,
+    SchemaPhaseState,
     WallTimeTracker,
     close_run,
     is_strict,
+    maybe_finalize_schema,
+    observe_name,
     open_aim_run,
     parse_aim_run_tags,
     resolve_run_config,
@@ -539,3 +543,581 @@ class TestEvalMetricPrefix:
         # eval Aim runs (Eval tab). Flipping back should be intentional
         # and break this test.
         assert EVAL_METRIC_PREFIX == "val"
+
+
+# ----------------------------------------------------------------------
+# Schema-phase machinery — observe_name + maybe_finalize_schema
+# ----------------------------------------------------------------------
+#
+# Schema-phase finalize is what makes the producer's metric names visible
+# to a separate-process reader on the NUC. The mechanism: drain the
+# write buffer, close the Aim Run (forces RocksDB memtable flush to
+# stable SST files), reopen the Run with force_resume=True so the
+# next sync cycle's rsync can see the schema and the dashboard can
+# enumerate metrics.
+#
+# These tests verify the state machine and graceful-degradation paths.
+# They use FakeAimRun so we exercise the orchestration without standing
+# up a real Aim transport server (which would defeat the unit-test
+# purpose). A live-aim integration test in test_composer covers the
+# end-to-end behavior.
+
+
+class _HashableFakeAimRun(FakeAimRun):
+    """FakeAimRun with a settable ``hash`` attribute.
+
+    Real ``aim.Run`` instances expose ``.hash``; the schema-finalize
+    code reads it to call ``Run(run_hash=...)`` on reopen. FakeAimRun
+    doesn't set hash by default, so tests that exercise the finalize
+    path use this subclass and set ``.hash`` explicitly.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.hash = kwargs.get("run_hash", None) or "test-hash-abcdef"
+
+
+@pytest.fixture
+def fake_aim_run_with_hash(monkeypatch):
+    """Like ``fake_aim_run`` but instances carry a ``.hash`` attribute."""
+    instances: list[_HashableFakeAimRun] = []
+
+    class _Recording(_HashableFakeAimRun):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            instances.append(self)
+
+    monkeypatch.setattr("aim.Run", _Recording)
+    return instances
+
+
+class TestObserveNameEdgeCases:
+    """``observe_name`` is a thin set.add wrapper, but the trivial
+    contract still has cases worth pinning so a future refactor that
+    e.g. adds normalization or filtering can't silently change behavior."""
+
+    def test_observe_empty_string_recorded(self):
+        # Empty string is a valid set element; if a metric name is empty
+        # that's a bug elsewhere — observe_name records what it's given.
+        state = SchemaPhaseState()
+        observe_name(state, "")
+        assert state.observed_names == {""}
+
+    def test_observe_idempotent_same_name(self):
+        state = SchemaPhaseState()
+        observe_name(state, "train/loss")
+        observe_name(state, "train/loss")
+        observe_name(state, "train/loss")
+        assert state.observed_names == {"train/loss"}
+
+    def test_observe_distinct_names_accumulate(self):
+        state = SchemaPhaseState()
+        for name in ("train/loss", "lr", "train/loss", "throughput"):
+            observe_name(state, name)
+        assert state.observed_names == {"train/loss", "lr", "throughput"}
+
+    def test_observe_does_not_touch_registered_names(self):
+        # observe should ONLY grow observed_names; registered_names is
+        # updated only by maybe_finalize_schema. Test prevents a future
+        # refactor that conflates them.
+        state = SchemaPhaseState()
+        observe_name(state, "train/loss")
+        assert state.registered_names == set()
+
+
+class TestMaybeFinalizeSchemaNoOps:
+    """Cases where maybe_finalize_schema must NOT call run.close() or
+    open a new Run — graceful no-ops the framework callback can call at
+    every boundary hook without worrying about wasted work."""
+
+    def test_none_run_returns_none(self):
+        # Callback degraded to no-op mode (Aim unreachable, strict-off).
+        # maybe_finalize_schema must not crash on None.
+        state = SchemaPhaseState()
+        observe_name(state, "train/loss")
+        result = maybe_finalize_schema(None, state, cfg=make_run_config())
+        assert result is None
+
+    def test_no_observed_names_returns_same_run(self, fake_aim_run_with_hash):
+        run = _HashableFakeAimRun()
+        state = SchemaPhaseState()
+        result = maybe_finalize_schema(run, state, cfg=make_run_config())
+        assert result is run
+        assert not run.closed  # we did NOT close it
+        assert state.finalize_count == 0
+
+    def test_all_observed_already_registered_returns_same_run(self, fake_aim_run_with_hash):
+        run = _HashableFakeAimRun()
+        state = SchemaPhaseState()
+        state.observed_names = {"train/loss", "lr"}
+        state.registered_names = {"train/loss", "lr"}  # already up to date
+        result = maybe_finalize_schema(run, state, cfg=make_run_config())
+        assert result is run
+        assert not run.closed
+        assert state.finalize_count == 0
+
+    def test_run_without_hash_returns_same_run(self, fake_aim_run_with_hash):
+        # Defensive: if run has no .hash attribute (couldn't happen
+        # against real aim.Run, but FakeAimRun could be misconstructed),
+        # we don't crash — we just decline to finalize.
+        run = _HashableFakeAimRun()
+        run.hash = None
+        state = SchemaPhaseState()
+        observe_name(state, "train/loss")
+        result = maybe_finalize_schema(run, state, cfg=make_run_config())
+        assert result is run
+        assert not run.closed
+
+
+class TestMaybeFinalizeSchemaHappyPath:
+    """Cases where maybe_finalize_schema does the close + reopen cycle."""
+
+    def test_observe_then_finalize_registers_names(self, fake_aim_run_with_hash):
+        run = _HashableFakeAimRun()
+        run.hash = "run-123456789"
+        fake_aim_run_with_hash.append(run)  # account for the original
+        state = SchemaPhaseState()
+        observe_name(state, "train/loss")
+        observe_name(state, "lr")
+
+        new_run = maybe_finalize_schema(run, state, cfg=make_run_config())
+
+        # State after finalize
+        assert state.registered_names == {"train/loss", "lr"}
+        assert state.finalize_count == 1
+        # observed_names continues to grow over the run's lifetime; not reset.
+        assert state.observed_names == {"train/loss", "lr"}
+        # Original run was closed
+        assert run.closed
+        # New Run object was created (different instance from the old one)
+        assert new_run is not run
+
+    def test_finalize_passes_run_hash_to_reopen(self, fake_aim_run_with_hash):
+        run = _HashableFakeAimRun()
+        run.hash = "specific-hash-xyz"
+        state = SchemaPhaseState()
+        observe_name(state, "metric_a")
+
+        cfg = make_run_config(aim_url="aim://test:9999")
+        new_run = maybe_finalize_schema(run, state, cfg=cfg)
+
+        # The newly-constructed FakeAimRun (via the fake_aim_run_with_hash
+        # patch) should have received run_hash, repo, and force_resume.
+        assert new_run is not run
+        assert new_run.kwargs.get("run_hash") == "specific-hash-xyz"
+        assert new_run.kwargs.get("repo") == "aim://test:9999"
+        assert new_run.kwargs.get("force_resume") is True
+
+    def test_second_finalize_with_new_names_works(self, fake_aim_run_with_hash):
+        # Simulates: batch_end finalizes for training metrics, then
+        # eval_end fires and a new eval metric appears, triggering
+        # another finalize.
+        run = _HashableFakeAimRun()
+        run.hash = "hash-1"
+        state = SchemaPhaseState()
+
+        observe_name(state, "train/loss")
+        run_after_1 = maybe_finalize_schema(run, state, cfg=make_run_config())
+        assert state.finalize_count == 1
+        assert state.registered_names == {"train/loss"}
+
+        # New eval metric appears
+        observe_name(state, "val/loss")
+        run_after_2 = maybe_finalize_schema(run_after_1, state, cfg=make_run_config())
+        assert state.finalize_count == 2
+        assert state.registered_names == {"train/loss", "val/loss"}
+        assert run_after_2 is not run_after_1
+        assert run_after_1.closed
+
+    def test_finalize_called_again_without_new_names_is_noop(self, fake_aim_run_with_hash):
+        # batch_end fires every batch; after schema settles, repeated
+        # calls must NOT churn close+reopen.
+        run = _HashableFakeAimRun()
+        run.hash = "hash-1"
+        state = SchemaPhaseState()
+        observe_name(state, "train/loss")
+
+        run_v1 = maybe_finalize_schema(run, state, cfg=make_run_config())
+        # 100 more batch_end calls with the same metric set
+        for _ in range(100):
+            same = maybe_finalize_schema(run_v1, state, cfg=make_run_config())
+            assert same is run_v1
+        assert state.finalize_count == 1  # only the original finalize counted
+
+
+class TestMaybeFinalizeSchemaSafetyCap:
+    """Pathological case: a callback that emits new metric names at
+    every boundary causes finalize churn. The safety cap halts at N
+    finalizes and degrades to "captured at close, not live" for
+    everything after."""
+
+    def test_hits_max_finalizes_then_noops(self, fake_aim_run_with_hash):
+        run = _HashableFakeAimRun()
+        run.hash = "h"
+        state = SchemaPhaseState(max_finalizes=3)
+
+        # Drive 3 successful finalizes
+        for i in range(3):
+            observe_name(state, f"m{i}")
+            run = maybe_finalize_schema(run, state, cfg=make_run_config())
+        assert state.finalize_count == 3
+
+        # 4th attempt: new name, but cap reached — must be no-op
+        observe_name(state, "m_too_late")
+        before = run
+        result = maybe_finalize_schema(run, state, cfg=make_run_config())
+        assert result is before
+        assert state.finalize_count == 3
+        assert "m_too_late" not in state.registered_names
+
+    def test_max_finalizes_warning_logged_once(self, fake_aim_run_with_hash, caplog):
+        import logging
+        run = _HashableFakeAimRun()
+        run.hash = "h"
+        state = SchemaPhaseState(max_finalizes=1)
+        observe_name(state, "first")
+        run = maybe_finalize_schema(run, state, cfg=make_run_config())
+
+        # Cap-hit case: should log a warning, but only once.
+        observe_name(state, "second")
+        with caplog.at_level(logging.WARNING):
+            maybe_finalize_schema(run, state, cfg=make_run_config())
+            observe_name(state, "third")
+            maybe_finalize_schema(run, state, cfg=make_run_config())
+        # Loguru routes through stderr by default — we set a sentinel
+        # on state to rate-limit, so the second cap-hit must not
+        # re-trigger the warning path.
+        assert getattr(state, "_max_finalizes_logged", False) is True
+
+
+class TestMaybeFinalizeSchemaFailureModes:
+    """When the close + reopen cycle hits an error, the function must
+    degrade gracefully — training continues even if dashboard
+    visibility is compromised."""
+
+    def test_run_close_raises_returns_original_run(self, fake_aim_run_with_hash):
+        # If run.close() raises, we do NOT proceed to reopen. The
+        # original run is returned. ``state.finalize_count`` does NOT
+        # increment; future calls will retry.
+        run = _HashableFakeAimRun()
+        run.hash = "h"
+        def raising_close(self):
+            self.closed = True
+            raise RuntimeError("simulated close failure")
+        # Bind unbound method-style so self is passed in
+        run.close = lambda: raising_close(run)
+
+        state = SchemaPhaseState()
+        observe_name(state, "train/loss")
+
+        result = maybe_finalize_schema(run, state, cfg=make_run_config())
+        assert result is run
+        assert state.finalize_count == 0
+        assert state.registered_names == set()  # NOT marked as registered
+
+    def test_reopen_raises_returns_closed_run(self, monkeypatch):
+        # close() succeeds, but Run(run_hash=..., force_resume=True)
+        # raises. We return the (now-closed) original; subsequent
+        # writes will silently fail via existing track_safely
+        # degradation. The state is NOT advanced — names stay observed
+        # but unregistered.
+        original = _HashableFakeAimRun()
+        original.hash = "h"
+
+        def raising_run(**kwargs):
+            raise RuntimeError("simulated reopen failure")
+        monkeypatch.setattr("aim.Run", raising_run)
+
+        state = SchemaPhaseState()
+        observe_name(state, "train/loss")
+
+        result = maybe_finalize_schema(original, state, cfg=make_run_config())
+        assert result is original
+        assert original.closed  # we did close it
+        assert state.finalize_count == 0
+        assert state.registered_names == set()
+
+
+class TestSchemaPhaseStateDefaults:
+    """The dataclass defaults are the contract for fresh runs."""
+
+    def test_fresh_state_is_empty(self):
+        state = SchemaPhaseState()
+        assert state.observed_names == set()
+        assert state.registered_names == set()
+        assert state.finalize_count == 0
+
+    def test_max_finalizes_default_is_10(self):
+        # Default cap matches what's in the plan doc. Bumping requires
+        # a deliberate change here and a corresponding plan update.
+        state = SchemaPhaseState()
+        assert state.max_finalizes == 10
+
+    def test_max_finalizes_overridable(self):
+        state = SchemaPhaseState(max_finalizes=3)
+        assert state.max_finalizes == 3
+
+
+# ----------------------------------------------------------------------
+# Local aim server lifecycle — _maybe_start_local_aim_server +
+# _parse_aim_url_host_port + _stop_local_aim_server
+# ----------------------------------------------------------------------
+#
+# When the engine sets ASTROLABE_AIM_REPO_PATH, the callback starts
+# a local ``aim server`` subprocess so the hot path (metric writes)
+# stays on localhost. The NUC-side sync sidecar pulls chunks via
+# SSH+rsync. These tests exercise the subprocess orchestration
+# without actually spawning aim — they monkey-patch subprocess.Popen.
+
+
+from astrolabe_callbacks._core import (
+    _maybe_start_local_aim_server,
+    _parse_aim_url_host_port,
+    _stop_local_aim_server,
+)
+
+
+class TestParseAimUrlHostPort:
+    """Pin URL-parsing edge cases. A wrong parse silently misroutes the
+    local server, so the failure mode is invisible."""
+
+    def test_standard_url(self):
+        assert _parse_aim_url_host_port("aim://localhost:43800") == ("localhost", 43800)
+
+    def test_ip_url(self):
+        assert _parse_aim_url_host_port("aim://10.0.0.5:9999") == ("10.0.0.5", 9999)
+
+    def test_wrong_scheme_returns_none(self):
+        assert _parse_aim_url_host_port("http://foo:80") is None
+        assert _parse_aim_url_host_port("foo:80") is None
+
+    def test_missing_port_returns_none(self):
+        assert _parse_aim_url_host_port("aim://localhost") is None
+
+    def test_non_integer_port_returns_none(self):
+        assert _parse_aim_url_host_port("aim://localhost:notanint") is None
+
+    def test_negative_port_returns_none(self):
+        assert _parse_aim_url_host_port("aim://localhost:-1") is None
+
+    def test_zero_port_returns_none(self):
+        assert _parse_aim_url_host_port("aim://localhost:0") is None
+
+    def test_empty_host_returns_none(self):
+        assert _parse_aim_url_host_port("aim://:43800") is None
+
+    def test_url_with_trailing_path_extracts_host_port(self):
+        # The remote-aim transport URLs sometimes include a trailing
+        # ``/`` or path; we strip and just take host:port.
+        assert _parse_aim_url_host_port("aim://nuc:43800/some/path") == ("nuc", 43800)
+
+
+class TestMaybeStartLocalAimServerNoOps:
+    """Cases where _maybe_start_local_aim_server must return None
+    without spawning a process. Each test asserts that subprocess.Popen
+    was NOT called — invariant for "no env var means existing behavior"
+    back-compat."""
+
+    def test_env_var_unset_returns_none(self, monkeypatch):
+        # Standalone user case: no ASTROLABE_AIM_REPO_PATH means use
+        # existing remote-only path. Must not start a server.
+        monkeypatch.delenv("ASTROLABE_AIM_REPO_PATH", raising=False)
+        called = []
+        monkeypatch.setattr(
+            "subprocess.Popen", lambda *a, **kw: called.append(1) or MagicMock()
+        )
+        result = _maybe_start_local_aim_server(make_run_config())
+        assert result is None
+        assert called == []
+
+    def test_unparseable_url_returns_none(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ASTROLABE_AIM_REPO_PATH", str(tmp_path))
+        cfg = make_run_config(aim_url="http://wrong-scheme:1234")
+        called = []
+        monkeypatch.setattr(
+            "subprocess.Popen", lambda *a, **kw: called.append(1) or MagicMock()
+        )
+        result = _maybe_start_local_aim_server(cfg)
+        assert result is None
+        assert called == []
+
+
+class TestMaybeStartLocalAimServerHappyPath:
+    """When env + URL are valid, we call subprocess.Popen with the
+    right args, poll for listening, and return the Popen handle."""
+
+    def test_spawns_subprocess_with_correct_args(self, monkeypatch, tmp_path):
+        import subprocess
+        monkeypatch.setenv("ASTROLABE_AIM_REPO_PATH", str(tmp_path))
+        # Pre-create .aim so we don't trigger init path.
+        (tmp_path / ".aim").mkdir()
+
+        spawned_args = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                spawned_args.append(args)
+                self.pid = 12345
+                self._exit_code = None
+
+            def poll(self):
+                return self._exit_code  # None = still running
+
+            def terminate(self):
+                self._exit_code = 0
+
+            def wait(self, timeout=None):
+                self._exit_code = 0
+                return 0
+
+            def kill(self):
+                self._exit_code = -9
+
+        monkeypatch.setattr("subprocess.Popen", FakePopen)
+
+        # Fake socket.create_connection to simulate "listening" on first try
+        class FakeSocket:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+
+        monkeypatch.setattr(
+            "socket.create_connection", lambda *a, **kw: FakeSocket()
+        )
+
+        cfg = make_run_config(aim_url="aim://127.0.0.1:43800")
+        proc = _maybe_start_local_aim_server(cfg)
+
+        assert proc is not None
+        assert len(spawned_args) == 1
+        args = spawned_args[0]
+        assert args[0] == "aim"
+        assert args[1] == "server"
+        assert "--host" in args
+        assert "127.0.0.1" in args
+        assert "--port" in args
+        assert "43800" in args
+        assert "--repo" in args
+        assert str(tmp_path) in args
+
+    def test_creates_repo_path_if_missing(self, monkeypatch, tmp_path):
+        # Repo path doesn't exist — open_aim_run must create the dir
+        # AND run ``aim init`` before spawning the server.
+        repo_path = tmp_path / "new-repo"
+        assert not repo_path.exists()
+        monkeypatch.setenv("ASTROLABE_AIM_REPO_PATH", str(repo_path))
+
+        run_calls = []
+        def fake_run(*args, **kwargs):
+            run_calls.append(args[0] if args else None)
+            return MagicMock(returncode=0)
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                self.pid = 1; self._exit_code = None
+            def poll(self): return self._exit_code
+            def terminate(self): self._exit_code = 0
+            def wait(self, timeout=None): self._exit_code = 0; return 0
+            def kill(self): self._exit_code = -9
+        monkeypatch.setattr("subprocess.Popen", FakePopen)
+
+        class FakeSocket:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        monkeypatch.setattr("socket.create_connection", lambda *a, **kw: FakeSocket())
+
+        cfg = make_run_config(aim_url="aim://localhost:43800")
+        proc = _maybe_start_local_aim_server(cfg)
+
+        assert proc is not None
+        assert repo_path.is_dir()
+        # aim init was called
+        assert len(run_calls) == 1
+        assert "init" in run_calls[0]
+        assert str(repo_path) in run_calls[0]
+
+
+class TestMaybeStartLocalAimServerFailures:
+    """When the subprocess fails to come up, we must clean up the
+    process handle and return None — never leak an orphan."""
+
+    def test_subprocess_exits_before_listening(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ASTROLABE_AIM_REPO_PATH", str(tmp_path))
+        (tmp_path / ".aim").mkdir()
+
+        class DyingPopen:
+            def __init__(self, args, **kwargs):
+                self.pid = 1
+                self.returncode = 1  # already exited
+
+            def poll(self):
+                return self.returncode  # non-None = exited
+
+            def terminate(self):
+                pass
+            def wait(self, timeout=None):
+                return self.returncode
+            def kill(self):
+                pass
+
+        monkeypatch.setattr("subprocess.Popen", DyingPopen)
+
+        cfg = make_run_config(aim_url="aim://localhost:43800")
+        proc = _maybe_start_local_aim_server(cfg)
+        assert proc is None  # never returns a dead handle
+
+
+class TestStopLocalAimServer:
+    """Cleanup must be idempotent and never raise."""
+
+    def test_none_proc_is_noop(self):
+        # Defensive: callers shouldn't pass None, but we don't crash.
+        _stop_local_aim_server(None)  # should not raise
+
+    def test_already_exited_is_noop(self):
+        class ExitedProc:
+            pid = 1
+            def poll(self): return 0  # already done
+
+        # Should not call terminate/kill.
+        _stop_local_aim_server(ExitedProc())
+
+    def test_terminate_called_on_running_proc(self):
+        calls = []
+
+        class RunningProc:
+            pid = 1
+            def poll(self):
+                return None if not calls else 0  # still running on first poll, exited after terminate
+            def terminate(self):
+                calls.append("terminate")
+            def wait(self, timeout=None):
+                return 0
+            def kill(self):
+                calls.append("kill")
+
+        _stop_local_aim_server(RunningProc())
+        assert "terminate" in calls
+        assert "kill" not in calls  # clean shutdown, no kill needed
+
+    def test_kill_escalation_on_timeout(self):
+        calls = []
+
+        class HangingProc:
+            pid = 1
+            def poll(self):
+                return None  # never exits
+            def terminate(self):
+                calls.append("terminate")
+            def wait(self, timeout=None):
+                if "terminate" in calls and "kill" not in calls:
+                    # First wait (post-terminate) times out; raise to trigger kill
+                    raise TimeoutError("simulated wait timeout")
+                return -9
+            def kill(self):
+                calls.append("kill")
+
+        _stop_local_aim_server(HangingProc())
+        assert calls == ["terminate", "kill"]

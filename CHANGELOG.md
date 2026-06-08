@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.0.0 — unreleased
+
+### Added
+
+- **Local-aim transport mode** (opt-in via the NUC's engine, not the training repo). When the engine sets `ASTROLABE_AIM_REPO_PATH=/path/to/local-repo` in the training environment, the callback spawns a local `aim server` subprocess on the compute host writing to that path. Training writes stay on localhost (~1900 writes/sec sustained vs. ~40/sec through the legacy SSH tunnel). The NUC-side `astrolabe-sync` sidecar pulls per-run RocksDB chunks every ~3s. Dashboard lag drops from minutes-to-hours under heavy emission to ~6-8s. See [astrolabe's `docs/aim-live-sync.md`](https://github.com/naston/astrolabe/blob/main/docs/aim-live-sync.md). Tunnel mode (no env var) remains the default; nothing changes for callers that don't opt in.
+- **Schema-phase finalize cycle.** At framework boundary hooks (Composer `batch_end`/`eval_end`, Lightning `on_train_batch_end`/`on_validation_end`, HuggingFace `on_log`/`on_evaluate`, raw PyTorch `log_train`/`log_eval`/`log`), the callback now observes metric names and — when new names appear since the last finalize — drains the buffer, closes the Aim Run, and reopens with `force_resume=True`. The close forces RocksDB memtable contents to flush to stable SST files, which is what makes new metric names visible to read-only readers like the sync sidecar's `RepoIndexManager.index()`. Typical Composer run: 1-2 finalize cycles. Optimizer handoffs (Muon→AdamW) trigger one additional cycle when the new optimizer's metrics first appear. Hard cap of 10 cycles per run prevents pathological churn. Each finalize emits a `schema_finalized` event with the new metric names (capped to 10) for post-mortem observability via the disk-stats jsonl.
+- **`AstrolabeRun.finalize_schema()`** on the raw-PyTorch helper for users who want to force a finalize at a specific point (e.g., after a hand-rolled warmup phase that registers every metric upfront). No-op when no new names have been observed.
+- New `astrolabe_callbacks._core.SchemaPhaseState` dataclass + `observe_name()` + `maybe_finalize_schema()` helpers. Public API; framework callbacks own the timing of `maybe_finalize_schema` calls.
+
+### Changed
+
+- Failures in the local-aim-server startup degrade gracefully: log a warning, callback falls back to direct-connect (legacy v1.x behavior) against whatever `aim_url` points at. Failure of the schema-phase reopen is similarly non-fatal — the callback keeps the (now-closed) Run object and existing `track_safely` graceful-degradation handles subsequent writes.
+
+### Migration
+
+- **Training repos**: bump the pin to v2.0+ in `requirements.txt`. No code changes required. The callback auto-detects the transport mode via the engine-injected `ASTROLABE_AIM_REPO_PATH` env var. Existing v1.x pins continue to work in tunnel mode even when the NUC has opted into local-aim mode (mixed-version rollout is supported).
+- **NUC admins**: opt into local-aim mode per `docs/aim-live-sync.md` after upgrading the training repos using this NUC.
+
+### Why a major version
+
+The local-aim mode adds a subprocess (`aim server`) and the schema-phase finalize cycle close-and-reopens the Aim Run. Both are invisible to training code and don't change the public API surface, but the internal lifecycle is materially different from v1.x. Pinning to v2.0+ in `requirements.txt` is an explicit acknowledgment that the new behavior is in effect.
+
 ## v1.1.0 — unreleased
 
 ### Added
