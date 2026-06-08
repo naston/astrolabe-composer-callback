@@ -1,0 +1,4 @@
+{
+  "_comment": "Pinned engine ref that astrolabe_callbacks/contract.py was vendored from. To update, edit `vendored_from` and run `python tools/vendor-contract.py`. CI enforces that the in-tree file matches this ref. Initial pin is a SHA on the engine's `dev` branch because no engine release tag carries contract.py yet — switch to a tag (e.g. astrolabe@v1.8.0) once one ships.",
+  "vendored_from": "astrolabe@93da23bdf762af052759bb8077b21f83122f9876"
+}

@@ -1,0 +1,88 @@
+# Contract sync — Gate A guard per astrolabe/plans/version-contract.md
+#
+# Refuses PRs where the vendored copy of astrolabe/contract.py has drifted
+# from what tools/vendor-contract.json claims was the source ref. The fix
+# is always to re-run `python tools/vendor-contract.py` and commit the
+# result (potentially after bumping `vendored_from` to a newer engine ref).
+#
+# This guards against two failure modes:
+#   1. Someone hand-edited the vendored contract.py (forbidden — engine is
+#      the source of truth)
+#   2. The engine repo's contract.py at the pinned ref has changed since
+#      the last vendor (force-push, history rewrite, etc.)
+
+name: Contract sync
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-vendored-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Re-vendor into a tmp file and compare
+        env:
+          # Needs repo:read scope on naston/astrolabe (private). Set in
+          # the callbacks repo's secrets as ASTROLABE_REPO_READ_TOKEN —
+          # a fine-grained PAT or GitHub App installation token works.
+          # Falls back to the workflow's own GITHUB_TOKEN, which won't
+          # have access to a different private repo by default.
+          GITHUB_TOKEN: ${{ secrets.ASTROLABE_REPO_READ_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ref=$(python -c 'import json; print(json.load(open("tools/vendor-contract.json"))["vendored_from"].split("@", 1)[1])')
+          url="https://raw.githubusercontent.com/naston/astrolabe/${ref}/astrolabe/contract.py"
+          echo "Pinned engine ref: ${ref}"
+          curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "${url}" > /tmp/expected_contract.py
+          if diff -u /tmp/expected_contract.py src/astrolabe_callbacks/contract.py; then
+            echo "✓ vendored contract.py matches engine@${ref}"
+          else
+            echo ""
+            echo "✗ src/astrolabe_callbacks/contract.py has drifted from"
+            echo "  astrolabe@${ref}/astrolabe/contract.py."
+            echo ""
+            echo "Re-vendor with:"
+            echo "  python tools/vendor-contract.py"
+            echo "  git add src/astrolabe_callbacks/contract.py tools/vendor-contract.json"
+            echo "  git commit -m 'chore: re-vendor contract.py from astrolabe@<ref>'"
+            echo ""
+            echo "If you intended to pin to a different engine ref, edit"
+            echo "tools/vendor-contract.json before re-running the script."
+            exit 1
+          fi
+
+      - name: Validate stdlib-only (defense in depth)
+        run: |
+          python - <<'PY'
+          import ast, sys, pathlib
+          src = pathlib.Path("src/astrolabe_callbacks/contract.py").read_text()
+          tree = ast.parse(src)
+          stdlib = set(sys.stdlib_module_names) | {"__future__"}
+          bad = []
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  for a in node.names:
+                      if a.name.split(".")[0] not in stdlib:
+                          bad.append(a.name)
+              elif isinstance(node, ast.ImportFrom):
+                  if node.level > 0 or node.module is None:
+                      continue
+                  if node.module.split(".")[0] not in stdlib:
+                      bad.append(node.module)
+          if bad:
+              sys.exit(f"✗ vendored contract.py has non-stdlib imports: {bad}")
+          print("✓ vendored contract.py is stdlib-only")
+          PY
