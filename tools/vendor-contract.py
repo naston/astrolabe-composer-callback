@@ -3,36 +3,43 @@
 
 The engine↔callback contract lives in the engine repo as the source of
 truth. Every callback library — first-party (this one) and any
-third-party — vendors a verbatim copy. This script does the copying.
+third-party — vendors a verbatim copy. This script does the copying
+and records the file's sha256 alongside the source ref.
 
-Why vendoring instead of a published ``astrolabe-contract`` package:
-keeps the project at three packages (engine, callback, dashboard), and
-keeps the training environment free of the engine library and its
-dependencies.
+Why hash-pinning (not a CI network fetch): the engine repo is private,
+which would require the callbacks-repo CI to hold a cross-repo
+read-token. That violates the spirit of the three-package boundary
+work — callbacks shouldn't depend on the engine repo at runtime OR at
+build time once the file has been vendored. The sha256 in
+``vendor-contract.json`` IS the integrity check: CI verifies the
+in-tree file matches the recorded hash. Hand-edits, accidental
+corruption, or any drift from the canonical contents fails the check
+without ever touching the network.
 
-Usage::
+Re-vendoring is a deliberate maintainer action. To pick up a newer
+contract from the engine repo:
 
-    python tools/vendor-contract.py
+    1. Edit ``tools/vendor-contract.json`` — bump ``vendored_from`` to
+       the new engine ref (e.g. ``astrolabe@v1.8.0``).
+    2. Run ``GITHUB_TOKEN=$(gh auth token) python tools/vendor-contract.py``.
+    3. Commit ``src/astrolabe_callbacks/contract.py`` + the updated
+       ``tools/vendor-contract.json`` (the script rewrites the hash).
 
-Reads the pinned engine ref from ``tools/vendor-contract.json``,
-downloads ``astrolabe/contract.py`` at that ref from GitHub, validates
-it's stdlib-only, and writes it to
-``src/astrolabe_callbacks/contract.py``.
+CI never runs this script; it only verifies the recorded hash.
 
-To update which engine version is vendored, edit
-``tools/vendor-contract.json`` and re-run.
-
-See ``plans/version-contract.md`` in the astrolabe repo (the section
-"Vendoring mechanism") for the full operating model.
+See ``plans/version-contract.md`` in the astrolabe repo for the full
+operating model.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -63,16 +70,15 @@ def _load_sidecar() -> tuple[str, str]:
 
         {
           "vendored_from": "astrolabe@v1.7.0",
-          "url_template": "https://..."  // optional, has a sensible default
+          "sha256": "<64-char hex>",       // rewritten by this script
+          "url_template": "https://..."    // optional, has a default
         }
-
-    The ``vendored_from`` string is ``"astrolabe@<ref>"`` where ``<ref>``
-    is any git ref the GitHub raw endpoint accepts (tag, branch, SHA).
     """
     if not SIDECAR_PATH.exists():
         raise VendorError(
             f"sidecar {SIDECAR_PATH.relative_to(REPO_ROOT)} not found. "
-            f"Create it with: {{\"vendored_from\": \"astrolabe@<ref>\"}}"
+            f"Create it with: "
+            f'{{"vendored_from": "astrolabe@<ref>", "sha256": ""}}'
         )
     data = json.loads(SIDECAR_PATH.read_text())
     vendored_from = data.get("vendored_from")
@@ -92,9 +98,11 @@ def _download(url: str) -> str:
     """Fetch the contract.py source at the given URL.
 
     The astrolabe repo is private, so we attach a GitHub token from
-    ``$GITHUB_TOKEN`` (or ``$GH_TOKEN``) when present. In GitHub
-    Actions, the workflow's ``GITHUB_TOKEN`` provides repo-read scope.
-    Locally, a personal access token works fine.
+    ``$GITHUB_TOKEN`` (or ``$GH_TOKEN``) when present. Locally:
+    ``export GITHUB_TOKEN=$(gh auth token)``.
+
+    This is only ever run by a maintainer at re-vendor time — CI does
+    not invoke this function (CI verifies the recorded sha256 only).
     """
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     req = urllib.request.Request(url)
@@ -112,8 +120,8 @@ def _download(url: str) -> str:
                 f"  - Confirm the ref exists at "
                 f"https://github.com/naston/astrolabe/tree/<ref>\n"
                 f"  - The astrolabe repo is private; export GITHUB_TOKEN "
-                f"with repo:read scope (or GH_TOKEN). gh CLI auth works: "
-                f"export GITHUB_TOKEN=$(gh auth token)"
+                f"with repo:read scope (e.g. "
+                f"export GITHUB_TOKEN=$(gh auth token))"
             ) from exc
         raise VendorError(f"HTTP {exc.code} fetching {url}: {exc.reason}") from exc
     except Exception as exc:
@@ -123,10 +131,10 @@ def _download(url: str) -> str:
 def _validate_stdlib_only(src: str) -> None:
     """Parse imports; refuse if any non-stdlib module is referenced.
 
-    The engine's own CI enforces stdlib-only at PR time (see the engine
-    repo's ``tools/check-contract-stdlib-only.py``). We re-validate here
-    as defense in depth — a malicious or buggy mirror of the contract
-    file would be caught before it lands in our package.
+    Defense in depth — the engine's CI guards this at PR time too. If
+    a vendored copy ever shows a non-stdlib import, that's either a
+    broken engine PR getting merged or a man-in-the-middle on the
+    GitHub fetch; either way, refusing is the right move.
     """
     tree = ast.parse(src)
     non_stdlib: list[str] = []
@@ -156,6 +164,10 @@ def _extract_version(src: str) -> str:
     return m.group(1)
 
 
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def main() -> int:
     try:
         ref, url_template = _load_sidecar()
@@ -173,12 +185,26 @@ def main() -> int:
         print(f"✗ {exc}", file=sys.stderr)
         return 1
 
+    digest = _sha256(src)
     DEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     DEST_PATH.write_text(src)
+
+    # Rewrite the sidecar with the new hash. Preserve any other keys
+    # (url_template, _comment, etc.) the maintainer set by hand.
+    data = json.loads(SIDECAR_PATH.read_text())
+    data["vendored_from"] = f"astrolabe@{ref}"
+    data["sha256"] = digest
+    SIDECAR_PATH.write_text(json.dumps(data, indent=2) + "\n")
+
     rel = DEST_PATH.relative_to(REPO_ROOT)
     print(f"✓ Vendored astrolabe/contract.py from astrolabe@{ref}")
     print(f"  → {rel}")
     print(f"  CONTRACT_VERSION: {version}")
+    print(f"  sha256: {digest}")
+    print("")
+    print("Commit both files:")
+    print(f"  git add {rel} tools/vendor-contract.json")
+    print(f"  git commit -m 'chore: re-vendor contract.py from astrolabe@{ref}'")
     return 0
 
 

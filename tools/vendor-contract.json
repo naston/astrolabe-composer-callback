@@ -1,4 +1,5 @@
 {
-  "_comment": "Pinned engine ref that astrolabe_callbacks/contract.py was vendored from. To update, edit `vendored_from` and run `python tools/vendor-contract.py`. CI enforces that the in-tree file matches this ref. Initial pin is a SHA on the engine's `dev` branch because no engine release tag carries contract.py yet — switch to a tag (e.g. astrolabe@v1.8.0) once one ships.",
-  "vendored_from": "astrolabe@93da23bdf762af052759bb8077b21f83122f9876"
+  "_comment": "Pinned engine ref that src/astrolabe_callbacks/contract.py was vendored from, plus a sha256 of the vendored file. To update: edit `vendored_from`, run `GITHUB_TOKEN=$(gh auth token) python tools/vendor-contract.py`, commit both this file and the new contract.py. CI verifies the in-tree contract.py matches this hash \u2014 no network call required at PR time.",
+  "vendored_from": "astrolabe@653c768ee13ffc0c9c033b5f5265cc15a55f057d",
+  "sha256": "c76e0025fc7df229a05405e865589bfd782e32f5f0cdac6beb681b537f1aca69"
 }

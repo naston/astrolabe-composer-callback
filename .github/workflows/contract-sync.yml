@@ -1,15 +1,15 @@
 # Contract sync — Gate A guard per astrolabe/plans/version-contract.md
 #
-# Refuses PRs where the vendored copy of astrolabe/contract.py has drifted
-# from what tools/vendor-contract.json claims was the source ref. The fix
-# is always to re-run `python tools/vendor-contract.py` and commit the
-# result (potentially after bumping `vendored_from` to a newer engine ref).
+# Verifies that src/astrolabe_callbacks/contract.py matches the sha256
+# recorded in tools/vendor-contract.json. The recorded hash IS the
+# integrity check: any hand-edit, corruption, or accidental drift fails
+# the check.
 #
-# This guards against two failure modes:
-#   1. Someone hand-edited the vendored contract.py (forbidden — engine is
-#      the source of truth)
-#   2. The engine repo's contract.py at the pinned ref has changed since
-#      the last vendor (force-push, history rewrite, etc.)
+# This workflow does NOT fetch anything from the engine repo. The
+# vendor script (tools/vendor-contract.py) is run by a maintainer at
+# re-vendor time, using their own GitHub token; CI only verifies the
+# resulting hash. See plans/version-contract.md Resolved decision #3
+# (2026-06-09 amendment) for why we moved off the network-fetch model.
 
 name: Contract sync
 
@@ -33,36 +33,44 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Re-vendor into a tmp file and compare
-        env:
-          # Needs repo:read scope on naston/astrolabe (private). Set in
-          # the callbacks repo's secrets as ASTROLABE_REPO_READ_TOKEN —
-          # a fine-grained PAT or GitHub App installation token works.
-          # Falls back to the workflow's own GITHUB_TOKEN, which won't
-          # have access to a different private repo by default.
-          GITHUB_TOKEN: ${{ secrets.ASTROLABE_REPO_READ_TOKEN || secrets.GITHUB_TOKEN }}
+      - name: Verify vendored contract.py matches recorded sha256
         run: |
-          set -euo pipefail
-          ref=$(python -c 'import json; print(json.load(open("tools/vendor-contract.json"))["vendored_from"].split("@", 1)[1])')
-          url="https://raw.githubusercontent.com/naston/astrolabe/${ref}/astrolabe/contract.py"
-          echo "Pinned engine ref: ${ref}"
-          curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "${url}" > /tmp/expected_contract.py
-          if diff -u /tmp/expected_contract.py src/astrolabe_callbacks/contract.py; then
-            echo "✓ vendored contract.py matches engine@${ref}"
-          else
-            echo ""
-            echo "✗ src/astrolabe_callbacks/contract.py has drifted from"
-            echo "  astrolabe@${ref}/astrolabe/contract.py."
-            echo ""
-            echo "Re-vendor with:"
-            echo "  python tools/vendor-contract.py"
-            echo "  git add src/astrolabe_callbacks/contract.py tools/vendor-contract.json"
-            echo "  git commit -m 'chore: re-vendor contract.py from astrolabe@<ref>'"
-            echo ""
-            echo "If you intended to pin to a different engine ref, edit"
-            echo "tools/vendor-contract.json before re-running the script."
-            exit 1
-          fi
+          python - <<'PY'
+          import hashlib, json, pathlib, sys
+
+          sidecar = json.loads(pathlib.Path("tools/vendor-contract.json").read_text())
+          src = pathlib.Path("src/astrolabe_callbacks/contract.py").read_text()
+          actual = hashlib.sha256(src.encode("utf-8")).hexdigest()
+          expected = sidecar.get("sha256", "")
+          ref = sidecar.get("vendored_from", "?")
+
+          print(f"Pinned engine ref: {ref}")
+          print(f"Recorded sha256:   {expected}")
+          print(f"Actual   sha256:   {actual}")
+
+          if not expected:
+              sys.exit(
+                  "\n✗ tools/vendor-contract.json has empty 'sha256'. "
+                  "Re-run tools/vendor-contract.py to populate it."
+              )
+          if actual != expected:
+              sys.exit(
+                  "\n✗ src/astrolabe_callbacks/contract.py does not match "
+                  "the sha256 recorded in tools/vendor-contract.json.\n\n"
+                  "Either someone edited the vendored copy by hand (don't — "
+                  "the engine is the source of truth), or the sidecar's "
+                  "recorded hash is wrong.\n\n"
+                  "If the contract file is what you want: re-record the "
+                  "hash by running\n"
+                  "  GITHUB_TOKEN=$(gh auth token) python tools/vendor-contract.py\n"
+                  "from the same engine ref, then commit the updated "
+                  "sidecar.\n\n"
+                  "If the contract file is wrong: revert it from a clean "
+                  "vendoring or `python tools/vendor-contract.py` to pull "
+                  "the canonical version."
+              )
+          print("✓ vendored contract.py matches recorded hash")
+          PY
 
       - name: Validate stdlib-only (defense in depth)
         run: |

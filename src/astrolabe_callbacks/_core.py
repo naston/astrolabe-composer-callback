@@ -43,6 +43,8 @@ from typing import Any
 
 from loguru import logger
 
+from astrolabe_callbacks import contract
+
 __all__ = [
     "EVAL_METRIC_PREFIX",
     "DEFAULT_AIM_URL",
@@ -494,7 +496,7 @@ def _append_stats_line(**fields) -> None:
     event is a single self-contained line — easy to ``tail``, easy to
     grep, easy to parse line-by-line without loading the whole file.
     """
-    path = os.environ.get("ASTROLABE_CALLBACK_STATS_PATH")
+    path = os.environ.get(contract.ENV_CALLBACK_STATS_PATH)
     if not path:
         return
     try:
@@ -520,38 +522,10 @@ def is_strict() -> bool:
     return os.environ.get(_STRICT_ENV, "").lower() in ("1", "true", "yes")
 
 
-def parse_aim_run_tags(raw: str | None) -> dict[str, str]:
-    """Parse the ``AIM_RUN_TAGS`` env var into a tag dict.
-
-    Format: ``key1=val1,key2=val2``. Whitespace around keys/values is
-    stripped. Entries without ``=``, with empty keys, or duplicate keys
-    (last wins) are tolerated rather than raising — this is reading
-    something a researcher pasted into a shell, not a strict format.
-
-    Parameters
-    ----------
-    raw : str | None
-        The raw env var value, or ``None``/empty.
-
-    Returns
-    -------
-    dict[str, str]
-        Parsed tags. Empty if ``raw`` is empty or unparseable.
-    """
-    if not raw:
-        return {}
-    out: dict[str, str] = {}
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry or "=" not in entry:
-            continue
-        key, _, value = entry.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if not key:
-            continue
-        out[key] = value
-    return out
+# The canonical parser lives in the vendored ``contract`` module so the
+# wire format stays in lockstep with the engine. Re-exported here for
+# backward compatibility with consumers that imported it from _core.
+parse_aim_run_tags = contract.parse_aim_run_tags
 
 
 @dataclass(frozen=True)
@@ -614,13 +588,16 @@ def resolve_run_config(
     RunConfig
         Frozen config dataclass.
     """
-    env_exp = os.environ.get("ASTROLABE_EXPERIMENT_NAME") or None
+    env_exp = os.environ.get(contract.ENV_EXPERIMENT_NAME) or None
     resolved_exp = env_exp or experiment_name or None
 
+    # ASTROLABE_AIM_URL is callback-side configuration (which Aim
+    # server to talk to), not part of the engine→callback contract.
+    # Stays as a bare literal here for now.
     env_url = os.environ.get("ASTROLABE_AIM_URL")
     resolved_url = env_url or aim_url or DEFAULT_AIM_URL
 
-    env_tags = parse_aim_run_tags(os.environ.get("AIM_RUN_TAGS"))
+    env_tags = contract.parse_aim_run_tags(os.environ.get(contract.ENV_AIM_RUN_TAGS))
     if env_tags:
         resolved_tags = env_tags
     elif tags is not None:
@@ -1072,16 +1049,16 @@ def _maybe_start_local_aim_server(cfg: "RunConfig") -> Any:
     import subprocess
     from pathlib import Path
 
-    repo_path = os.environ.get("ASTROLABE_AIM_REPO_PATH")
+    repo_path = os.environ.get(contract.ENV_AIM_REPO_PATH)
     if not repo_path:
         return None
 
     host_port = _parse_aim_url_host_port(cfg.aim_url)
     if host_port is None:
         logger.warning(
-            "ASTROLABE_AIM_REPO_PATH is set but cfg.aim_url={!r} is not a "
+            "{} is set but cfg.aim_url={!r} is not a "
             "parseable aim://host:port — skipping local server startup.",
-            cfg.aim_url,
+            contract.ENV_AIM_REPO_PATH, cfg.aim_url,
         )
         return None
     host, port = host_port
