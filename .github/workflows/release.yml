@@ -1,0 +1,148 @@
+# Release-prep workflow — Gate C per astrolabe/plans/testing-and-deploy.md
+#
+# Triggered by `vX.Y.Z` (or `vX.Y.Z-rcN`) tag push. Builds the wheel,
+# smoke-installs into a fresh venv, then publishes a GitHub Release
+# with the wheel attached. Researcher repos pin against this artifact:
+#
+#   astrolabe-callbacks @ https://github.com/naston/astrolabe-composer-callback/
+#                           releases/download/v2.0.0/
+#                           astrolabe_callbacks-2.0.0-py3-none-any.whl
+#
+# Free signal only — wheel build + import smoke + vendored-contract
+# integrity check. No engine, no Lambda, no training run. The engine's
+# submit-time version gate is where compatibility is actually
+# enforced.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to release (e.g. v2.1.0 or v2.1.0-rc1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build, smoke, publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version
+        id: ver
+        run: |
+          REF="${{ inputs.tag || github.ref }}"
+          TAG="${REF#refs/tags/}"
+          PEP440="${TAG#v}"
+          if [[ "${TAG}" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "pep440=${PEP440}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=${TAG} pep440=${PEP440} prerelease=${PRERELEASE}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: pip install --upgrade build
+
+      - name: Sync wheel version with tag
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ steps.ver.outputs.pep440 }}\"/" pyproject.toml
+          grep "^version" pyproject.toml
+
+      - name: Build wheel
+        run: |
+          python -m build --wheel --outdir dist
+          ls -la dist/
+
+      - name: Install smoke (fresh venv, wheel-only)
+        # Catches the class of bug where the wheel installs but the
+        # vendored contract or a framework adapter is missing. The
+        # vendored contract.py specifically MUST be present in the
+        # wheel — without it, training code on a Lambda instance can't
+        # resolve the contract and the version gate's downstream
+        # checks would lie.
+        run: |
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/pip install --quiet dist/*.whl
+
+          echo ""
+          echo "=== installed package ==="
+          /tmp/smoke-venv/bin/pip show astrolabe-callbacks
+
+          echo ""
+          echo "=== contract module ships + helpers callable ==="
+          /tmp/smoke-venv/bin/python - <<'PY'
+          from astrolabe_callbacks import contract
+          # CONTRACT_VERSION must be a string semver — catches an
+          # accidental wheel that doesn't include the vendored file or
+          # got built from a corrupted tree.
+          assert isinstance(contract.CONTRACT_VERSION, str)
+          assert contract.CONTRACT_VERSION.count(".") >= 2
+          # Helpers must round-trip — catches a wheel built against a
+          # bad vendor (which the in-repo hash check would also catch,
+          # but defense in depth).
+          enc = contract.format_aim_run_tags({"a": "b", "c": "d"})
+          assert contract.parse_aim_run_tags(enc) == {"a": "b", "c": "d"}
+          print(f"CONTRACT_VERSION = {contract.CONTRACT_VERSION}")
+          print(f"format/parse roundtrip OK")
+          PY
+
+          echo ""
+          echo "=== framework adapters import ==="
+          /tmp/smoke-venv/bin/python - <<'PY'
+          # Each adapter is a thin wrapper; an import failure here
+          # usually means a public API surface drifted (e.g. a typo
+          # in a framework-conditional re-export). Each on its own line
+          # so a failure points at one module.
+          from astrolabe_callbacks._core import open_aim_run, close_run
+          from astrolabe_callbacks._core import resolve_run_config
+          # Framework adapters have optional dependencies (composer,
+          # lightning, transformers) that may not be present in the
+          # smoke env. We test only that the MODULE imports — not that
+          # the class inside it does, since that requires the optional
+          # dep. The composer module's parse_aim_run_tags re-export is
+          # the only thing we need to assert is wired correctly.
+          from astrolabe_callbacks import composer as _composer_mod
+          assert hasattr(_composer_mod, "parse_aim_run_tags")
+          print("core + framework adapter modules import cleanly")
+          PY
+
+          echo ""
+          echo "✓ install smoke passed"
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp dist/*.whl release-artifacts/
+          cd release-artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
+          files: |
+            release-artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
