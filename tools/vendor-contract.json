@@ -1,0 +1,5 @@
+{
+  "_comment": "Pinned engine ref that src/astrolabe_callbacks/contract.py was vendored from, plus a sha256 of the vendored file. To update: edit `vendored_from`, run `GITHUB_TOKEN=$(gh auth token) python tools/vendor-contract.py`, commit both this file and the new contract.py. CI verifies the in-tree contract.py matches this hash \u2014 no network call required at PR time.",
+  "vendored_from": "astrolabe@653c768ee13ffc0c9c033b5f5265cc15a55f057d",
+  "sha256": "c76e0025fc7df229a05405e865589bfd782e32f5f0cdac6beb681b537f1aca69"
+}

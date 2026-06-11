@@ -1,0 +1,96 @@
+# Contract sync — Gate A guard per astrolabe/plans/version-contract.md
+#
+# Verifies that src/astrolabe_callbacks/contract.py matches the sha256
+# recorded in tools/vendor-contract.json. The recorded hash IS the
+# integrity check: any hand-edit, corruption, or accidental drift fails
+# the check.
+#
+# This workflow does NOT fetch anything from the engine repo. The
+# vendor script (tools/vendor-contract.py) is run by a maintainer at
+# re-vendor time, using their own GitHub token; CI only verifies the
+# resulting hash. See plans/version-contract.md Resolved decision #3
+# (2026-06-09 amendment) for why we moved off the network-fetch model.
+
+name: Contract sync
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-vendored-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify vendored contract.py matches recorded sha256
+        run: |
+          python - <<'PY'
+          import hashlib, json, pathlib, sys
+
+          sidecar = json.loads(pathlib.Path("tools/vendor-contract.json").read_text())
+          src = pathlib.Path("src/astrolabe_callbacks/contract.py").read_text()
+          actual = hashlib.sha256(src.encode("utf-8")).hexdigest()
+          expected = sidecar.get("sha256", "")
+          ref = sidecar.get("vendored_from", "?")
+
+          print(f"Pinned engine ref: {ref}")
+          print(f"Recorded sha256:   {expected}")
+          print(f"Actual   sha256:   {actual}")
+
+          if not expected:
+              sys.exit(
+                  "\n✗ tools/vendor-contract.json has empty 'sha256'. "
+                  "Re-run tools/vendor-contract.py to populate it."
+              )
+          if actual != expected:
+              sys.exit(
+                  "\n✗ src/astrolabe_callbacks/contract.py does not match "
+                  "the sha256 recorded in tools/vendor-contract.json.\n\n"
+                  "Either someone edited the vendored copy by hand (don't — "
+                  "the engine is the source of truth), or the sidecar's "
+                  "recorded hash is wrong.\n\n"
+                  "If the contract file is what you want: re-record the "
+                  "hash by running\n"
+                  "  GITHUB_TOKEN=$(gh auth token) python tools/vendor-contract.py\n"
+                  "from the same engine ref, then commit the updated "
+                  "sidecar.\n\n"
+                  "If the contract file is wrong: revert it from a clean "
+                  "vendoring or `python tools/vendor-contract.py` to pull "
+                  "the canonical version."
+              )
+          print("✓ vendored contract.py matches recorded hash")
+          PY
+
+      - name: Validate stdlib-only (defense in depth)
+        run: |
+          python - <<'PY'
+          import ast, sys, pathlib
+          src = pathlib.Path("src/astrolabe_callbacks/contract.py").read_text()
+          tree = ast.parse(src)
+          stdlib = set(sys.stdlib_module_names) | {"__future__"}
+          bad = []
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  for a in node.names:
+                      if a.name.split(".")[0] not in stdlib:
+                          bad.append(a.name)
+              elif isinstance(node, ast.ImportFrom):
+                  if node.level > 0 or node.module is None:
+                      continue
+                  if node.module.split(".")[0] not in stdlib:
+                      bad.append(node.module)
+          if bad:
+              sys.exit(f"✗ vendored contract.py has non-stdlib imports: {bad}")
+          print("✓ vendored contract.py is stdlib-only")
+          PY
